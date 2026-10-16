@@ -59,6 +59,13 @@ export function loopDirFor(config: LoopConfig, loopId: string): string {
 /** Thrown when a phase session finishes without the mandatory submission tool call. */
 class PhaseIncomplete extends Error {}
 
+/** What each phase's session must file to count as complete. */
+const EXPECTED_SUBMISSION: Record<PbaRole, "plan" | "build" | "verdict"> = {
+  plan: "plan",
+  build: "build",
+  audit: "verdict",
+}
+
 /** Loops currently being driven by this plugin instance (one server process). */
 const activeLoops = new Set<string>()
 
@@ -119,7 +126,7 @@ async function runPhase(
   const info = await ctx.session.get({ sessionID })
   const outcome = info.outcome
   const fresh = await readState(loopDir)
-  if (fresh.submission?.kind !== role) {
+  if (fresh.submission?.kind !== EXPECTED_SUBMISSION[role]) {
     await appendEvents(loopDir, [{ event: "phase.incomplete", phase: role, attempt: state.attempt, outcome }])
     throw new PhaseIncomplete(
       `the ${role} session ended (outcome: ${outcome ?? "unknown"}) without calling its mandatory submission tool`,
