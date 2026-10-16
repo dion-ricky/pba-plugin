@@ -72,21 +72,32 @@ async function spawnPhaseSession(
   state: PbaState,
   role: PbaRole,
 ): Promise<string> {
+  // Model resolution order: explicit per-role override > the origin (main)
+  // session's selected model, variant included > OpenCode's config default.
+  let model: { id: string; providerID: string; variant?: string } | undefined
+  const override = config.models[role]
+  if (override) {
+    const slash = override.indexOf("/")
+    model = { providerID: override.slice(0, slash), id: override.slice(slash + 1) }
+  } else {
+    try {
+      const origin = await ctx.session.get({ sessionID: state.originSessionID })
+      if (origin.model) {
+        model = { providerID: origin.model.providerID, id: origin.model.id, variant: origin.model.variant }
+      }
+    } catch (cause) {
+      console.error(`[pba] could not read origin session model: ${(cause as Error).message}`)
+    }
+  }
+
   const created = await ctx.session.create({
     title: `PBA ${state.loopId} · ${role} (attempt ${state.attempt})`,
     agent: AGENT_BY_ROLE[role],
     parentID: state.originSessionID,
     location: { directory: config.rootDir },
+    ...(model ? { model } : {}),
   })
   const sessionID = created.id
-  const modelRef = config.models[role]
-  if (modelRef) {
-    const slash = modelRef.indexOf("/")
-    await ctx.session.switchModel({
-      sessionID,
-      model: { providerID: modelRef.slice(0, slash), id: modelRef.slice(slash + 1) },
-    })
-  }
   await updateState(loopDirFor(config, state.loopId), (draft) => {
     draft.sessions[role] = sessionID
   })

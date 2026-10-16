@@ -49,13 +49,15 @@ function makeMockCtx(script: MockScript) {
   const tools = new Map<string, ToolDef>()
   const synthetics: string[] = []
   const sessionsByRole = new Map<string, string>()
+  const createdModels: ({ id: string; providerID: string; variant?: string } | undefined)[] = []
   let counter = 0
   const ctx = {
     session: {
-      create: async (input: { agent?: string }) => {
+      create: async (input: { agent?: string; model?: { id: string; providerID: string; variant?: string } }) => {
         const id = `ses_mock_${++counter}`
         const role = AGENT_TO_ROLE[input.agent ?? ""]
         if (role) sessionsByRole.set(role, id)
+        createdModels.push(input.model)
         return { id }
       },
       switchModel: async () => {},
@@ -66,7 +68,13 @@ function makeMockCtx(script: MockScript) {
         await script.act(role, s.attempt, tools, sessionsByRole)
       },
       wait: async () => {},
-      get: async () => ({ outcome: "succeeded" }),
+      get: async (input: { sessionID: string }) => {
+        // The origin session reports the model its user picked in the TUI/CLI.
+        if (input.sessionID === "ses_origin") {
+          return { outcome: "succeeded", model: { providerID: "mock", id: "mock-main", variant: "high" } }
+        }
+        return { outcome: "succeeded" }
+      },
       synthetic: async (input: { text: string }) => {
         synthetics.push(input.text)
       },
@@ -77,7 +85,7 @@ function makeMockCtx(script: MockScript) {
       },
     },
   }
-  return { ctx, tools, synthetics, sessionsByRole }
+  return { ctx, tools, synthetics, sessionsByRole, createdModels }
 }
 
 async function waitFor(loopDir: string, statuses: string[], timeoutMs = 3000): Promise<state.PbaState> {
@@ -189,6 +197,52 @@ await scenario("approve-first-attempt", async (root) => {
   check("review.md written", (await fs.readFile(`${currentLoopDir}/review.md`, "utf8")).includes("All criteria met"))
   check("changed files recorded", final.changedFiles[0] === "src/thing.ts")
   check("origin notified", mock.synthetics.some((t) => t.includes("completed")), mock.synthetics.join(" // "))
+  check(
+    "phase sessions inherit origin model (incl. variant)",
+    mock.createdModels.length === 3 &&
+      mock.createdModels.every((m) => m?.providerID === "mock" && m.id === "mock-main" && m.variant === "high"),
+    JSON.stringify(mock.createdModels),
+  )
+})
+
+// -- 1b. Explicit per-role model override beats the origin session's model ---
+await scenario("explicit-model-override-wins", async (root) => {
+  const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3, models: { audit: "gateway/audit-model" } })
+  const mock = makeMockCtx({
+    act: async (role, _attempt, tools, sessions) => {
+      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "build") {
+        await tools.get("pba_build_complete")!.execute(
+          { summary: "Did the thing", changedFiles: ["src/thing.ts"] },
+          toolContext(sessions.get("build")!),
+        )
+      }
+      if (role === "audit") {
+        await tools.get("pba_verdict")!.execute(
+          { verdict: "approved", report: "# Review\nOK.", findings: [] },
+          toolContext(sessions.get("audit")!),
+        )
+      }
+    },
+  })
+  const sessionLoops: SessionLoopMap = new Map()
+  await registerTools(mock.ctx as never, config, sessionLoops)
+  const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
+  currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
+  check("override scenario completes", final.status === "completed", final.status)
+  const auditModel = mock.createdModels[2]
+  check(
+    "planner/builder inherit origin model, auditor uses override",
+    mock.createdModels.length === 3 &&
+      mock.createdModels[0]?.id === "mock-main" &&
+      mock.createdModels[0]?.variant === "high" &&
+      mock.createdModels[1]?.id === "mock-main" &&
+      auditModel?.id === "audit-model" &&
+      auditModel?.providerID === "gateway",
+    JSON.stringify(mock.createdModels),
+  )
 })
 
 // -- 2. Disapproved once, then approved on revision --------------------------

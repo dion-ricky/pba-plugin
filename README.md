@@ -119,7 +119,15 @@ the options block is only needed to change defaults.
 
 The three role agents are markdown files in this repo's `agents/` directory
 (`pba-planner`, `pba-builder`, `pba-auditor`); `install.sh` converts them into
-the target project's `agents` config:
+the target project's `agents` config.
+
+**Model selection** for phase sessions, in priority order:
+
+1. explicit `options.models.<role>` override (see Configuration), else
+2. the origin session's selected model — variant included — so a loop started
+   from a session running e.g. `ai-gateway/glm-5.3-flash#high` runs all phases
+   on exactly that model, else
+3. OpenCode's configured default model.
 
 | Agent | System prompt | Guardrails |
 |---|---|---|
