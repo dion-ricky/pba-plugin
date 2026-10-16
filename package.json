@@ -1,0 +1,19 @@
+{
+  "name": "opencode-pba-plugin",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin: supervised plan-build-audit loop (planner -> builder -> auditor) with per-repo markdown+JSON coordination state",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "bun smoke-state.ts && bun smoke-loop.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "^2.0.30",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
