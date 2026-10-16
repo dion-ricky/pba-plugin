@@ -28,6 +28,24 @@ export interface VerdictRecord {
   at: string
 }
 
+/** Verdict filed by one parallel perspective auditor for one attempt. */
+export interface PerspectiveVerdictRecord {
+  perspective: string
+  attempt: number
+  verdict: PbaVerdict
+  findings: string[]
+  report: string
+  at: string
+}
+
+/**
+ * Session map: the three role keys plus `audit:<perspective>` keys used by the
+ * parallel perspective auditor sessions spawned during the audit phase.
+ */
+export type PbaSessions = Partial<Record<PbaRole, string>> & {
+  [auditPerspective: `audit:${string}`]: string
+}
+
 export interface PbaState {
   version: 1
   loopId: string
@@ -42,7 +60,7 @@ export interface PbaState {
   /** Retry budget for the current phase when a session ends without submitting. */
   phaseRetries: number
   revision: boolean
-  sessions: Partial<Record<PbaRole, string>>
+  sessions: PbaSessions
   submission: { kind: PbaSubmissionKind; at: string } | null
   planSummary: string | null
   tasks: string[]
@@ -50,6 +68,8 @@ export interface PbaState {
   buildSummary: string | null
   changedFiles: string[]
   verdicts: VerdictRecord[]
+  /** Per-perspective verdicts from the parallel audit phase (absent in older state files). */
+  perspectiveVerdicts?: PerspectiveVerdictRecord[]
   lastError: string | null
   createdAt: string
   updatedAt: string
@@ -139,15 +159,27 @@ export async function writeState(loopDir: string, state: PbaState): Promise<PbaS
   return next
 }
 
-/** Read-modify-write helper. The closure mutates a fresh copy; it must not await. */
+/**
+ * Read-modify-write helper. The closure mutates a fresh copy; it must not await.
+ * Serialized per loop directory via an in-process async mutex: parallel
+ * perspective auditor sessions (and their spawns) mutate the same state.json
+ * concurrently, and interleaved read-modify-write cycles would lose records.
+ */
+const updateLocks = new Map<string, Promise<unknown>>()
+
 export async function updateState(
   loopDir: string,
   mutate: (draft: PbaState) => void,
 ): Promise<PbaState> {
-  const state = await readState(loopDir)
-  const draft: PbaState = JSON.parse(JSON.stringify(state))
-  mutate(draft)
-  return writeState(loopDir, draft)
+  const previous = updateLocks.get(loopDir) ?? Promise.resolve()
+  const run = previous.then(async () => {
+    const state = await readState(loopDir)
+    const draft: PbaState = JSON.parse(JSON.stringify(state))
+    mutate(draft)
+    return writeState(loopDir, draft)
+  })
+  updateLocks.set(loopDir, run.then(() => undefined, () => undefined))
+  return run
 }
 
 export async function writeArtifact(loopDir: string, filename: string, content: string): Promise<void> {
@@ -249,6 +281,9 @@ export function formatState(state: PbaState): string {
   if (state.changedFiles.length > 0) lines.push(`changed files: ${state.changedFiles.join(", ")}`)
   for (const v of state.verdicts) {
     lines.push(`verdict (attempt ${v.attempt}): ${v.verdict}${v.findings.length > 0 ? ` — ${v.findings.length} finding(s)` : ""}`)
+  }
+  for (const v of state.perspectiveVerdicts ?? []) {
+    lines.push(`perspective verdict (attempt ${v.attempt}): ${v.perspective}: ${v.verdict}${v.findings.length > 0 ? ` — ${v.findings.length} finding(s)` : ""}`)
   }
   if (state.lastError) lines.push(`last error: ${state.lastError}`)
   lines.push(`updated: ${state.updatedAt}`)

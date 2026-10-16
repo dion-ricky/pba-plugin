@@ -7,10 +7,10 @@ the plugin from persisted state — the models only file artifacts, they never
 decide control flow.
 
 ```
-spec ──► PLANNER ──► plan.md ──► BUILDER ──► changed files ──► AUDITOR
-              ▲                                              │
-              └────────── disapproved + findings ◄───────────┘
-                                        approved ──► done (summary posted to your session)
+spec ──► PLANNER ──► plan.md ──► BUILDER ──► changed files ──► AUDITORS (one per perspective, in parallel)
+              ▲                                                       │
+              └────────── disapproved + findings ◄────────────────────┘
+                                            all approved ──► done (summary posted to your session)
 ```
 
 ## Repo layout
@@ -100,6 +100,9 @@ plus the three agents under `agents` (exactly what `install.sh` generates).
       "options": {
         "stateDir": ".pba",      // coordination dir, relative to the repo
         "maxAttempts": 3,        // disapprovals before the loop escalates to you
+        "auditPerspectives": [   // audit phase: one parallel auditor per perspective
+          "spec-adherence", "bugs", "security", "code-quality"
+        ],
         "models": {              // optional per-role overrides ("provider/model")
           "plan": "anthropic/claude-sonnet-4-5",
           "build": "anthropic/claude-sonnet-4-5",
@@ -140,6 +143,25 @@ Each role must finish with its mandatory structured submission tool
 schema-validated: a disapproval requires specific findings; an approval
 requires empty findings. The orchestrator retries a phase once if a session
 ends without submitting, then fails the loop with a clear error.
+
+### Parallel multi-perspective audit
+
+The audit phase does not run a single auditor: it spawns **one auditor session
+per perspective in parallel** (by default `spec-adherence`, `bugs`,
+`security`, `code-quality`), each prompted to verify the build strictly through
+its own lens with concrete evidence (file paths, line references, check
+output) — an acceptance criterion an auditor cannot verify with evidence
+counts as unmet. Each perspective auditor writes its own `review-<perspective>.md`
+and files its own verdict. The orchestrator then merges the perspective
+verdicts deterministically (no extra LLM step):
+
+- the loop is **approved** only if *every* perspective approves;
+- otherwise the disapproving perspectives' findings — each prefixed
+  `[<perspective>]` — go back to the planner as one merged review.
+
+Configure the set with the `auditPerspectives` option (a non-empty array of
+kebab-case names); the `audit` model override applies to all perspective
+sessions.
 
 ## Safety behavior
 

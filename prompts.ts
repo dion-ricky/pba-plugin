@@ -1,9 +1,10 @@
 // Role prompts and prompt builders for the PBA loop.
 //
 // The three agents (pba-planner / pba-builder / pba-auditor) are defined as
-// markdown agents in `.opencode/agents/`; their markdown body is the *role*
-// system prompt. What this module builds is the *per-loop task prompt* the
-// orchestrator sends when it spawns each phase session.
+// markdown agents in `agents/` (mirrored inline in opencode.jsonc); their
+// markdown body is the *role* system prompt. What this module builds is the
+// *per-loop task prompt* the orchestrator sends when it spawns each phase
+// session.
 
 import type { PbaState } from "./state"
 
@@ -68,10 +69,36 @@ Loop directory: ${loopDir}
 Calling \`pba_build_complete\` is MANDATORY and is how you finish this phase.`
 }
 
-export function auditorPrompt(state: PbaState, loopDir: string): string {
+/** Default audit perspectives; overridable via options.auditPerspectives. */
+export const DEFAULT_PERSPECTIVES = ["spec-adherence", "bugs", "security", "code-quality"] as const
+
+/** Concrete review checklist per default audit perspective. */
+export const PERSPECTIVE_GUIDANCE: Record<string, string> = {
+  "spec-adherence":
+    "You own full verification of every plan task and every acceptance criterion, one by one, with evidence. " +
+    "A deviation from the plan is only acceptable if the builder justified it in the build summary.",
+  bugs:
+    "Focus on the correctness of the new/changed logic: edge cases, error handling, null/undefined handling, " +
+    "race conditions, and broken or missing test coverage for the change.",
+  security:
+    "Focus on injection, committed secrets, unsafe subprocess/exec, permission/auth regressions, input validation, " +
+    "and unsafe file paths. This repo spawns shell commands and writes files, so shell-quoting and path traversal are in scope.",
+  "code-quality":
+    "Focus on naming, duplication, dead code, type safety (tsc --noEmit), matching the surrounding style, and comment accuracy.",
+}
+
+export function auditorPrompt(state: PbaState, loopDir: string, perspective: string): string {
   const changed = state.changedFiles.length > 0 ? state.changedFiles.join(", ") : "see state"
+  const guidance =
+    PERSPECTIVE_GUIDANCE[perspective] ?? `Focus strictly on the "${perspective}" perspective.`
   return `You are the AUDITOR phase of PBA loop \`${state.loopId}\` (attempt ${state.attempt}/${state.maxAttempts}).
 Loop directory: ${loopDir}
+
+## Your assigned perspective: ${perspective}
+
+${guidance}
+
+You are one of several parallel auditors, each covering a different perspective. Review ONLY through your perspective's lens (plus the general procedure below).
 
 ## Your procedure
 
@@ -80,19 +107,32 @@ Loop directory: ${loopDir}
 3. Review what the builder produced. Reported changed files: ${changed}.
    - Inspect the working-tree diff: \`git diff\` for tracked files and read untracked
      files listed in the state.
-   - Verify every task in the plan was implemented and every acceptance criterion is met.
+   - Verify every plan task and every acceptance criterion relevant to your perspective.
 4. You may run cheap read-only checks (tests, linters, typechecks) if the repo has them.
 5. Do NOT modify any files. You are read-only.
-6. Submit your decision with the \`pba_verdict\` tool:
+6. Submit your decision with the \`pba_verdict\` tool, passing \`perspective: "${perspective}"\`:
+   - \`perspective\`: "${perspective}" (REQUIRED — identifies your report among the parallel auditors)
    - \`verdict\`: "approved" or "disapproved".
    - \`report\`: full audit report in markdown (what you checked, what passed, what failed).
+     It is written to review-${perspective}.md.
    - \`findings\`: numbered, specific, actionable issues. REQUIRED and non-empty when
      disapproved; each finding should reference the plan task or acceptance criterion it
      violates. Empty array when approved.
 
-Be strict: disapprove if any acceptance criterion is unmet or the change deviates from
-the plan without justification. Calling \`pba_verdict\` is MANDATORY and is how you
-finish this phase.`
+## Strictness rules
+
+- Verify, don't assume: for EVERY acceptance criterion and plan task relevant to your perspective,
+  cite concrete evidence — file path + line references, or the output of a check you ran. An
+  acceptance criterion you cannot verify with evidence is treated as UNMET.
+- Disapprove if any acceptance criterion is unmet, any relevant plan task is missing, a deviation
+  is unjustified, or your perspective finds any new problem introduced by the change. When genuinely
+  uncertain after investigating, disapprove — a false disapproval costs one loop iteration; a false
+  approval ships broken code to the user.
+- Findings must be specific and actionable: file, what is wrong, and what the planner should change.
+  Vague findings waste a whole loop iteration.
+- Do not disapprove for style preferences that the plan did not require.
+
+Calling \`pba_verdict\` with \`perspective: "${perspective}"\` is MANDATORY and is how you finish this phase.`
 }
 
 export const SKILL_CONTENT = `# PBA loop (plan-build-audit)
@@ -130,4 +170,13 @@ build is approved or the attempt budget is exhausted.
 
 The loop writes its coordination state under \`.pba/<loopId>/\` in the repo
 (state.json, plan.md, review.md, events.jsonl).
+
+## Audit phase
+
+The audit phase runs one auditor session per perspective (spec-adherence, bugs,
+security, code-quality by default; configurable via \`auditPerspectives\`) in
+parallel, each filing its own verdict with evidence. The orchestrator then
+merges the perspective verdicts deterministically: approved only if every
+perspective approves; otherwise the findings of all disapproving perspectives
+go back to the planner.
 `

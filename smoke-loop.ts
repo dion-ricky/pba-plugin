@@ -1,7 +1,8 @@
 // End-to-end smoke test of the PBA loop with a mocked plugin context.
-// Simulates the three role agents by invoking the registered submission tools
-// exactly as real sessions would, then asserts the loop's state machine
-// behavior: approval, revision, escalation, missing-submission retry, resume.
+// Simulates the role agents (including one auditor session per audit
+// perspective) by invoking the registered submission tools exactly as real
+// sessions would, then asserts the loop's state machine behavior: approval,
+// revision, escalation, missing-submission retry, resume.
 //
 // Run: bun smoke-loop.ts
 import { promises as fs } from "node:fs"
@@ -31,7 +32,13 @@ const AGENT_TO_ROLE: Record<string, string> = {
 }
 
 interface MockScript {
-  act: (role: string, attempt: number, tools: Map<string, ToolDef>, sessions: Map<string, string>) => Promise<void>
+  act: (
+    role: string,
+    sessionID: string,
+    attempt: number,
+    tools: Map<string, ToolDef>,
+    sessions: Map<string, string>,
+  ) => Promise<void>
 }
 
 function toolContext(sessionID: string) {
@@ -50,6 +57,9 @@ function makeMockCtx(script: MockScript) {
   const synthetics: string[] = []
   const sessionsByRole = new Map<string, string>()
   const createdModels: ({ id: string; providerID: string; variant?: string } | undefined)[] = []
+  // Track in-flight tool executions so session.wait is realistic: a session
+  // only "ends" after the submission tools it invoked have settled.
+  let inFlight = 0
   let counter = 0
   const ctx = {
     session: {
@@ -61,13 +71,20 @@ function makeMockCtx(script: MockScript) {
         return { id }
       },
       switchModel: async () => {},
+      // Role resolution mirrors production: session IDs are recorded in state
+      // (sessions.plan / sessions.build / sessions["audit:<perspective>"]).
       prompt: async (input: { sessionID: string; text: string }) => {
-        const role = [...sessionsByRole.entries()].find(([, id]) => id === input.sessionID)?.[0]
-        if (!role) throw new Error(`mock: prompt for unknown session ${input.sessionID}`)
         const s = await state.readState(currentLoopDir!)
-        await script.act(role, s.attempt, tools, sessionsByRole)
+        const entry = Object.entries(s.sessions).find(([, id]) => id === input.sessionID)
+        if (!entry) throw new Error(`mock: prompt for unknown session ${input.sessionID}`)
+        const role = entry[0].startsWith("audit:") ? "audit" : entry[0]
+        await script.act(role, input.sessionID, s.attempt, tools, sessionsByRole)
       },
-      wait: async () => {},
+      wait: async () => {
+        while (inFlight > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+      },
       get: async (input: { sessionID: string }) => {
         // The origin session reports the model its user picked in the TUI/CLI.
         if (input.sessionID === "ses_origin") {
@@ -81,7 +98,21 @@ function makeMockCtx(script: MockScript) {
     },
     tool: {
       transform: async (fn: (editor: { add: (t: ToolDef) => void; namespace: () => void }) => Promise<void>) => {
-        await fn({ add: (t) => tools.set(t.name, t), namespace: () => {} })
+        await fn({
+          add: (t) =>
+            tools.set(t.name, {
+              name: t.name,
+              execute: async (args, context) => {
+                inFlight++
+                try {
+                  return await t.execute(args, context)
+                } finally {
+                  inFlight--
+                }
+              },
+            }),
+          namespace: () => {},
+        })
       },
     },
   }
@@ -125,6 +156,50 @@ async function submitPlan(tools: Map<string, ToolDef>, sessions: Map<string, str
   return result.content
 }
 
+async function submitBuild(tools: Map<string, ToolDef>, sessions: Map<string, string>, attempt: number) {
+  await tools.get("pba_build_complete")!.execute(
+    { summary: `Build ${attempt}`, changedFiles: ["src/thing.ts"] },
+    toolContext(sessions.get("build")!),
+  )
+}
+
+type ScriptedVerdict = {
+  verdict: "approved" | "disapproved"
+  report: string
+  findings: string[]
+}
+
+/** Resolve the audit perspective of an auditor session from state.sessions. */
+function perspectiveOfSession(s: state.PbaState, sessionID: string): string | undefined {
+  const entry = Object.entries(s.sessions).find(
+    ([key, id]) => key.startsWith("audit:") && id === sessionID,
+  )
+  return entry?.[0].slice("audit:".length)
+}
+
+/** File one perspective verdict as the auditor session identified by sessionID. */
+async function filePerspectiveVerdict(
+  tools: Map<string, ToolDef>,
+  sessionID: string,
+  scripted: (perspective: string, attempt: number) => ScriptedVerdict,
+) {
+  const s = await state.readState(currentLoopDir!)
+  const perspective = perspectiveOfSession(s, sessionID)
+  if (!perspective) throw new Error(`mock: session ${sessionID} has no audit:<perspective> key in state`)
+  await tools.get("pba_verdict")!.execute(
+    { perspective, ...scripted(perspective, s.attempt) },
+    toolContext(sessionID),
+  )
+}
+
+function allApprove(perspective: string): ScriptedVerdict {
+  return {
+    verdict: "approved",
+    report: `# Review (${perspective})\nAll criteria met from the ${perspective} perspective.`,
+    findings: [],
+  }
+}
+
 let currentLoopDir: string | null = null
 
 function placeholderState() {
@@ -155,7 +230,7 @@ function placeholderState() {
 
 async function scenario(name: string, fn: (root: string) => Promise<void>) {
   console.log(`\n== ${name}`)
-  const root = await fs.mkdtemp(`/tmp/pba-loop-${name}-`)
+  const root = await fs.mkdtemp("/tmp/pba-loop-" + name + "-")
   try {
     await fn(root)
   } finally {
@@ -167,20 +242,10 @@ async function scenario(name: string, fn: (root: string) => Promise<void>) {
 await scenario("approve-first-attempt", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
-    act: async (role, _attempt, tools, sessions) => {
+    act: async (role, sessionID, attempt, tools, sessions) => {
       if (role === "plan") await submitPlan(tools, sessions)
-      if (role === "build") {
-        await tools.get("pba_build_complete")!.execute(
-          { summary: "Did the thing", changedFiles: ["src/thing.ts"] },
-          toolContext(sessions.get("build")!),
-        )
-      }
-      if (role === "audit") {
-        await tools.get("pba_verdict")!.execute(
-          { verdict: "approved", report: "# Review\nAll criteria met.", findings: [] },
-          toolContext(sessions.get("audit")!),
-        )
-      }
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
     },
   })
   const sessionLoops: SessionLoopMap = new Map()
@@ -192,14 +257,14 @@ await scenario("approve-first-attempt", async (root) => {
   check("status completed", final.status === "completed", final.status)
   check("phase done", final.phase === "done")
   check("one attempt", final.attempt === 1, String(final.attempt))
-  check("one verdict", final.verdicts.length === 1 && final.verdicts[0].verdict === "approved")
+  check("one merged verdict", final.verdicts.length === 1 && final.verdicts[0].verdict === "approved")
   check("plan.md written", (await fs.readFile(`${currentLoopDir}/plan.md`, "utf8")).includes("Do the thing"))
-  check("review.md written", (await fs.readFile(`${currentLoopDir}/review.md`, "utf8")).includes("All criteria met"))
+  check("review.md written", (await fs.readFile(`${currentLoopDir}/review.md`, "utf8")).includes("Merged verdict"))
   check("changed files recorded", final.changedFiles[0] === "src/thing.ts")
   check("origin notified", mock.synthetics.some((t) => t.includes("completed")), mock.synthetics.join(" // "))
   check(
     "phase sessions inherit origin model (incl. variant)",
-    mock.createdModels.length === 3 &&
+    mock.createdModels.length === 6 &&
       mock.createdModels.every((m) => m?.providerID === "mock" && m.id === "mock-main" && m.variant === "high"),
     JSON.stringify(mock.createdModels),
   )
@@ -209,20 +274,10 @@ await scenario("approve-first-attempt", async (root) => {
 await scenario("explicit-model-override-wins", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3, models: { audit: "gateway/audit-model" } })
   const mock = makeMockCtx({
-    act: async (role, _attempt, tools, sessions) => {
+    act: async (role, sessionID, attempt, tools, sessions) => {
       if (role === "plan") await submitPlan(tools, sessions)
-      if (role === "build") {
-        await tools.get("pba_build_complete")!.execute(
-          { summary: "Did the thing", changedFiles: ["src/thing.ts"] },
-          toolContext(sessions.get("build")!),
-        )
-      }
-      if (role === "audit") {
-        await tools.get("pba_verdict")!.execute(
-          { verdict: "approved", report: "# Review\nOK.", findings: [] },
-          toolContext(sessions.get("audit")!),
-        )
-      }
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
     },
   })
   const sessionLoops: SessionLoopMap = new Map()
@@ -232,15 +287,15 @@ await scenario("explicit-model-override-wins", async (root) => {
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("override scenario completes", final.status === "completed", final.status)
-  const auditModel = mock.createdModels[2]
+  const auditModels = mock.createdModels.slice(2)
   check(
-    "planner/builder inherit origin model, auditor uses override",
-    mock.createdModels.length === 3 &&
+    "planner/builder inherit origin model, all perspective auditors use override",
+    mock.createdModels.length === 6 &&
       mock.createdModels[0]?.id === "mock-main" &&
       mock.createdModels[0]?.variant === "high" &&
       mock.createdModels[1]?.id === "mock-main" &&
-      auditModel?.id === "audit-model" &&
-      auditModel?.providerID === "gateway",
+      auditModels.length === 4 &&
+      auditModels.every((m) => m?.id === "audit-model" && m?.providerID === "gateway"),
     JSON.stringify(mock.createdModels),
   )
 })
@@ -249,20 +304,18 @@ await scenario("explicit-model-override-wins", async (root) => {
 await scenario("revision-then-approve", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
-    act: async (role, attempt, tools, sessions) => {
+    act: async (role, sessionID, attempt, tools, sessions) => {
       if (role === "plan") await submitPlan(tools, sessions)
-      if (role === "build") {
-        await tools.get("pba_build_complete")!.execute(
-          { summary: `Build ${attempt}`, changedFiles: ["src/thing.ts"] },
-          toolContext(sessions.get("build")!),
-        )
-      }
+      if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
-        await tools.get("pba_verdict")!.execute(
-          attempt === 1
-            ? { verdict: "disapproved", report: "# Review\nNot done.", findings: ["1. Acceptance criterion 1 unmet: thing.ts missing the thing"] }
-            : { verdict: "approved", report: "# Review\nFixed.", findings: [] },
-          toolContext(sessions.get("audit")!),
+        await filePerspectiveVerdict(tools, sessionID, (p, at) =>
+          at === 1 && p === "bugs"
+            ? {
+                verdict: "disapproved",
+                report: `# Review (bugs)\nNot done.`,
+                findings: ["1. Acceptance criterion 1 unmet: thing.ts missing the thing"],
+              }
+            : allApprove(p),
         )
       }
     },
@@ -274,28 +327,25 @@ await scenario("revision-then-approve", async (root) => {
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("completed on attempt 2", final.status === "completed" && final.attempt === 2, `${final.status} attempt=${final.attempt}`)
-  check("two verdicts recorded", final.verdicts.length === 2)
+  check("two merged verdicts recorded", final.verdicts.length === 2)
+  check("attempt-1 merged findings prefixed with [bugs]", final.verdicts[0]?.findings.every((f) => f.startsWith("[bugs]")) === true, JSON.stringify(final.verdicts[0]?.findings))
   check("revision flag set", final.revision === true)
-  check("findings flowed back", mock.synthetics.some((t) => t.includes("disapproved") && t.includes("1 finding")))
+  check("findings flowed back", mock.synthetics.some((t) => t.includes("disapproved") && t.includes("1 finding") && t.includes("bugs")), mock.synthetics.join(" // "))
 })
 
 // -- 3. Escalation when the budget is exhausted ------------------------------
 await scenario("escalate-at-max-attempts", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 2 })
   const mock = makeMockCtx({
-    act: async (role, _attempt, tools, sessions) => {
+    act: async (role, sessionID, attempt, tools, sessions) => {
       if (role === "plan") await submitPlan(tools, sessions)
-      if (role === "build") {
-        await tools.get("pba_build_complete")!.execute(
-          { summary: "Build", changedFiles: ["src/thing.ts"] },
-          toolContext(sessions.get("build")!),
-        )
-      }
+      if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
-        await tools.get("pba_verdict")!.execute(
-          { verdict: "disapproved", report: "# Review\nStill bad.", findings: ["1. Still broken"] },
-          toolContext(sessions.get("audit")!),
-        )
+        await filePerspectiveVerdict(tools, sessionID, (p) => ({
+          verdict: "disapproved",
+          report: `# Review (${p})\nStill bad.`,
+          findings: ["1. Still broken"],
+        }))
       }
     },
   })
@@ -327,7 +377,12 @@ await scenario("incomplete-phase-retry-then-fail", async (root) => {
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("failed", final.status === "failed", final.status)
-  check("error mentions missing submission", (final.lastError ?? "").includes("without calling its mandatory submission tool"), final.lastError ?? "")
+  check(
+    "error mentions missing submission",
+    (final.lastError ?? "").includes("without calling its mandatory submission tool") ||
+      (final.lastError ?? "").includes("without filing its perspective verdict"),
+    final.lastError ?? "",
+  )
   await waitForSynthetic(mock.synthetics, "failed")
   check("origin notified of failure", true)
 })
@@ -337,21 +392,11 @@ await scenario("resume-recovers", async (root) => {
   let behave = false
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
-    act: async (role, _attempt, tools, sessions) => {
+    act: async (role, sessionID, attempt, tools, sessions) => {
       if (!behave) return
       if (role === "plan") await submitPlan(tools, sessions)
-      if (role === "build") {
-        await tools.get("pba_build_complete")!.execute(
-          { summary: "Did the thing", changedFiles: ["src/thing.ts"] },
-          toolContext(sessions.get("build")!),
-        )
-      }
-      if (role === "audit") {
-        await tools.get("pba_verdict")!.execute(
-          { verdict: "approved", report: "# Review\nOK.", findings: [] },
-          toolContext(sessions.get("audit")!),
-        )
-      }
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
     },
   })
   const sessionLoops: SessionLoopMap = new Map()
@@ -453,6 +498,218 @@ await scenario("config-validation", async (root) => {
     err = (cause as Error).message
   }
   check("model ref validated", err.includes('must look like "provider/model"'), err)
+
+  err = ""
+  try {
+    resolveConfig(root, { auditPerspectives: [] })
+  } catch (cause) {
+    err = (cause as Error).message
+  }
+  check("empty auditPerspectives rejected", err.includes("auditPerspectives"), err)
+
+  err = ""
+  try {
+    resolveConfig(root, { auditPerspectives: ["Bad Name!"] })
+  } catch (cause) {
+    err = (cause as Error).message
+  }
+  check("non-kebab-case perspective rejected", err.includes("auditPerspectives"), err)
+
+  const defaults = resolveConfig(root, {})
+  check(
+    "default perspectives",
+    JSON.stringify(defaults.auditPerspectives) === JSON.stringify(["spec-adherence", "bugs", "security", "code-quality"]),
+    JSON.stringify(defaults.auditPerspectives),
+  )
+})
+
+// -- 8. All perspective auditors approve: merged verdict completes the loop --
+await scenario("all-perspectives-approve", async (root) => {
+  const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
+  const mock = makeMockCtx({
+    act: async (role, sessionID, attempt, tools, sessions) => {
+      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
+    },
+  })
+  const sessionLoops: SessionLoopMap = new Map()
+  await registerTools(mock.ctx as never, config, sessionLoops)
+  const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
+  currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
+  check("loop completed", final.status === "completed", final.status)
+  const auditKeys = Object.keys(final.sessions).filter((k) => k.startsWith("audit:")).sort()
+  check(
+    "session per perspective",
+    auditKeys.join(",") === "audit:bugs,audit:code-quality,audit:security,audit:spec-adherence",
+    auditKeys.join(","),
+  )
+  check("4 perspectiveVerdicts", final.perspectiveVerdicts?.length === 4, String(final.perspectiveVerdicts?.length))
+  check("merged verdict approved", final.verdicts[0]?.verdict === "approved", JSON.stringify(final.verdicts))
+  const review = await fs.readFile(`${currentLoopDir}/review.md`, "utf8")
+  for (const p of ["spec-adherence", "bugs", "security", "code-quality"]) {
+    check(`review.md has per-perspective section for ${p}`, review.includes(`## ${p}`))
+    check(`review-${p}.md exists`, (await fs.readFile(`${currentLoopDir}/review-${p}.md`, "utf8")).includes(perspectiveOfSession(final, final.sessions[`audit:${p}`]!) ?? ""))
+  }
+})
+
+// -- 9. One disapproving perspective sends [perspective]-prefixed findings back
+await scenario("one-perspective-disapproves", async (root) => {
+  const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
+  const mock = makeMockCtx({
+    act: async (role, sessionID, attempt, tools, sessions) => {
+      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") {
+        await filePerspectiveVerdict(tools, sessionID, (p, at) =>
+          at === 1 && p === "security"
+            ? {
+                verdict: "disapproved",
+                report: `# Review (security)\nUnsafe.`,
+                findings: ["1. Unescaped shell interpolation in src/thing.ts"],
+              }
+            : allApprove(p),
+        )
+      }
+    },
+  })
+  const sessionLoops: SessionLoopMap = new Map()
+  await registerTools(mock.ctx as never, config, sessionLoops)
+  const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
+  currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
+  check("completed on revision", final.status === "completed" && final.attempt === 2, `${final.status} attempt=${final.attempt}`)
+  check(
+    "attempt-1 merged verdict disapproved with [security] finding",
+    final.verdicts[0]?.verdict === "disapproved" &&
+      final.verdicts[0]?.findings.length === 1 &&
+      final.verdicts[0]?.findings[0].startsWith("[security] "),
+    JSON.stringify(final.verdicts[0]?.findings),
+  )
+  check("8 perspectiveVerdicts across 2 attempts", final.perspectiveVerdicts?.length === 8, String(final.perspectiveVerdicts?.length))
+  await waitForSynthetic(mock.synthetics, "disapproved")
+  check("planner announcement mentions disapproval", true)
+})
+
+// -- 10. Missing perspective verdict: retried, only missing session respawned -
+await scenario("missing-perspective-verdict-retried", async (root) => {
+  const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
+  const auditSessionsSeen: string[] = []
+  let skippedOnce = false
+  const mock = makeMockCtx({
+    act: async (role, sessionID, attempt, tools, sessions) => {
+      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") {
+        const s = await state.readState(currentLoopDir!)
+        const perspective = perspectiveOfSession(s, sessionID)!
+        auditSessionsSeen.push(perspective)
+        if (perspective === "security" && !skippedOnce) {
+          skippedOnce = true
+          return // security auditor never files its verdict on the first pass
+        }
+        await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
+      }
+    },
+  })
+  const sessionLoops: SessionLoopMap = new Map()
+  await registerTools(mock.ctx as never, config, sessionLoops)
+  const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
+  currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
+  check("completed after retry", final.status === "completed", `${final.status}: ${final.lastError ?? ""}`)
+  const counts: Record<string, number> = {}
+  for (const p of auditSessionsSeen) counts[p] = (counts[p] ?? 0) + 1
+  check("filed perspectives spawned exactly once", ["spec-adherence", "bugs", "code-quality"].every((p) => counts[p] === 1), JSON.stringify(counts))
+  check("missing perspective re-spawned", counts["security"] === 2, JSON.stringify(counts))
+  check("4 perspectiveVerdicts", final.perspectiveVerdicts?.length === 4, String(final.perspectiveVerdicts?.length))
+})
+
+// -- 11. Concurrent pba_verdict calls: no lost perspective verdicts ----------
+await scenario("concurrent-verdicts-not-lost", async (root) => {
+  const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
+  const mock = makeMockCtx({
+    act: async (role, sessionID, attempt, tools, sessions) => {
+      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") {
+        // Interleave the parallel verdict submissions before the state
+        // read-modify-write so the per-loop mutex is actually exercised.
+        await new Promise((resolve) => setTimeout(resolve, Math.random() * 20))
+        await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
+      }
+    },
+  })
+  const sessionLoops: SessionLoopMap = new Map()
+  await registerTools(mock.ctx as never, config, sessionLoops)
+  const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
+  currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
+  check("completed", final.status === "completed", `${final.status}: ${final.lastError ?? ""}`)
+  check("all 4 concurrent verdicts recorded", final.perspectiveVerdicts?.length === 4, JSON.stringify(final.perspectiveVerdicts?.map((v) => v.perspective)))
+  const perspectives = new Set(final.perspectiveVerdicts?.map((v) => v.perspective) ?? [])
+  check(
+    "each perspective recorded exactly once",
+    ["spec-adherence", "bugs", "security", "code-quality"].every((p) => perspectives.has(p)),
+    JSON.stringify([...perspectives]),
+  )
+})
+
+// -- 12. Stray legacy verdict (no perspective) rejected in a parallel loop ---
+await scenario("stray-legacy-verdict-rejected-in-parallel-audit", async (root) => {
+  const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
+  const mock = makeMockCtx({
+    act: async (role, sessionID, attempt, tools, sessions) => {
+      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "build") await submitBuild(tools, sessions, attempt)
+      if (role === "audit") {
+        const s = await state.readState(currentLoopDir!)
+        const perspective = perspectiveOfSession(s, sessionID)!
+        if (perspective === "bugs" && attempt === 1) {
+          // One perspective auditor misbehaves: calls pba_verdict WITHOUT
+          // the perspective argument before filing its real verdict.
+          try {
+            await tools.get("pba_verdict")!.execute(
+              { verdict: "approved", report: "# stray legacy verdict", findings: [] },
+              toolContext(sessionID),
+            )
+            check("legacy verdict rejected in parallel loop", false, "no error thrown")
+          } catch (cause) {
+            check(
+              "legacy verdict rejected in parallel loop",
+              String((cause as Error).message).includes("perspective"),
+              String((cause as Error).message),
+            )
+          }
+        }
+        await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
+      }
+    },
+  })
+  const sessionLoops: SessionLoopMap = new Map()
+  await registerTools(mock.ctx as never, config, sessionLoops)
+  const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
+  currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
+  check("loop completed despite stray legacy call", final.status === "completed", `${final.status}: ${final.lastError ?? ""}`)
+  check("4 perspectiveVerdicts (none lost)", final.perspectiveVerdicts?.length === 4, String(final.perspectiveVerdicts?.length))
+  check(
+    "exactly one merged verdict for attempt 1, approved",
+    final.verdicts.length === 1 && final.verdicts[0].attempt === 1 && final.verdicts[0].verdict === "approved",
+    JSON.stringify(final.verdicts),
+  )
+  const review = await fs.readFile(`${currentLoopDir}/review.md`, "utf8")
+  check("review.md has merged verdict header", review.includes("Merged verdict"))
+  for (const p of ["spec-adherence", "bugs", "security", "code-quality"]) {
+    check(`review.md has per-perspective section for ${p}`, review.includes(`## ${p}`))
+    check(`review-${p}.md exists`, (await fs.readFile(`${currentLoopDir}/review-${p}.md`, "utf8")).includes(perspectiveOfSession(final, final.sessions[`audit:${p}`]!) ?? ""))
+  }
 })
 
 if (failures > 0) {

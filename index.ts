@@ -9,8 +9,9 @@
 //              in natural language.
 //
 // The three role agents (pba-planner / pba-builder / pba-auditor) are markdown
-// agents in `.opencode/agents/` — the plugin spawns them as child sessions and
-// drives the loop deterministically from persisted state under `.pba/`.
+// agents in `agents/` (mirrored inline in opencode.jsonc) — the plugin spawns
+// them as child sessions and drives the loop deterministically from persisted
+// state under `.pba/`.
 //
 // Configuration via opencode.json(c):
 //   {
@@ -20,6 +21,9 @@
 //         "options": {
 //           "stateDir": ".pba",        // coordination dir, relative to the repo
 //           "maxAttempts": 3,          // build attempts before escalation
+//           "auditPerspectives": [     // audit phase: one parallel auditor per perspective
+//             "spec-adherence", "bugs", "security", "code-quality"
+//           ],
 //           "models": {                // optional per-role model overrides
 //             "plan": "provider/model",
 //             "build": "provider/model",
@@ -42,6 +46,8 @@ export interface PbaPluginOptions {
   stateDir?: string
   maxAttempts?: number
   models?: { plan?: string; build?: string; audit?: string }
+  /** Perspectives reviewed in parallel during the audit phase (default: spec-adherence, bugs, security, code-quality). */
+  auditPerspectives?: string[]
 }
 
 export default Plugin.define({

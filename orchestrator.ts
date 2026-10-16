@@ -15,11 +15,14 @@ import {
   readState,
   rebuildIndex,
   updateState,
+  writeArtifact,
   writeState,
+  type PerspectiveVerdictRecord,
   type PbaRole,
   type PbaState,
+  type PbaVerdict,
 } from "./state"
-import { AGENT_BY_ROLE, auditorPrompt, builderPrompt, plannerPrompt } from "./prompts"
+import { AGENT_BY_ROLE, auditorPrompt, builderPrompt, DEFAULT_PERSPECTIVES, plannerPrompt } from "./prompts"
 
 export interface PbaOptions {
   /** Directory name for coordination state, relative to the repo root. */
@@ -28,6 +31,8 @@ export interface PbaOptions {
   maxAttempts?: number
   /** Optional per-role model override as "provider/model". */
   models?: { plan?: string; build?: string; audit?: string }
+  /** Perspectives reviewed in parallel during the audit phase. */
+  auditPerspectives?: string[]
 }
 
 export interface LoopConfig {
@@ -35,6 +40,7 @@ export interface LoopConfig {
   stateDirName: string
   maxAttempts: number
   models: { plan?: string; build?: string; audit?: string }
+  auditPerspectives: string[]
 }
 
 export function resolveConfig(rootDir: string, options: PbaOptions | undefined): LoopConfig {
@@ -49,7 +55,16 @@ export function resolveConfig(rootDir: string, options: PbaOptions | undefined):
       throw new Error(`[pba] options.models.${role} must look like "provider/model", got "${ref}"`)
     }
   }
-  return { rootDir, stateDirName: options?.stateDir ?? ".pba", maxAttempts, models }
+  const auditPerspectives = options?.auditPerspectives ?? [...DEFAULT_PERSPECTIVES]
+  const invalid = !Array.isArray(auditPerspectives) ||
+    auditPerspectives.length === 0 ||
+    auditPerspectives.some((p) => typeof p !== "string" || p.length === 0 || !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(p))
+  if (invalid) {
+    throw new Error(
+      `[pba] options.auditPerspectives must be a non-empty array of kebab-case perspective names, got ${JSON.stringify(options?.auditPerspectives)}`,
+    )
+  }
+  return { rootDir, stateDirName: options?.stateDir ?? ".pba", maxAttempts, models, auditPerspectives }
 }
 
 export function loopDirFor(config: LoopConfig, loopId: string): string {
@@ -78,6 +93,7 @@ async function spawnPhaseSession(
   config: LoopConfig,
   state: PbaState,
   role: PbaRole,
+  sessionKey?: PbaRole | `audit:${string}`,
 ): Promise<string> {
   // Model resolution order: explicit per-role override > the origin (main)
   // session's selected model, variant included > OpenCode's config default.
@@ -98,7 +114,7 @@ async function spawnPhaseSession(
   }
 
   const created = await ctx.session.create({
-    title: `PBA ${state.loopId} · ${role} (attempt ${state.attempt})`,
+    title: `PBA ${state.loopId} · ${sessionKey ?? role} (attempt ${state.attempt})`,
     agent: AGENT_BY_ROLE[role],
     parentID: state.originSessionID,
     location: { directory: config.rootDir },
@@ -106,7 +122,7 @@ async function spawnPhaseSession(
   })
   const sessionID = created.id
   await updateState(loopDirFor(config, state.loopId), (draft) => {
-    draft.sessions[role] = sessionID
+    draft.sessions[sessionKey ?? role] = sessionID
   })
   return sessionID
 }
@@ -133,6 +149,117 @@ async function runPhase(
     )
   }
   await appendEvents(loopDir, [{ event: "phase.submitted", phase: role, attempt: state.attempt }])
+}
+
+/** One parallel perspective auditor session; must file its perspective verdict. */
+async function runPerspectiveAudit(
+  ctx: PluginContext,
+  config: LoopConfig,
+  state: PbaState,
+  perspective: string,
+): Promise<void> {
+  const loopDir = loopDirFor(config, state.loopId)
+  const sessionID = await spawnPhaseSession(ctx, config, state, "audit", `audit:${perspective}`)
+  await appendEvents(loopDir, [
+    { event: "phase.start", phase: "audit", perspective, attempt: state.attempt, sessionID },
+  ])
+  await ctx.session.prompt({ sessionID, text: auditorPrompt(state, loopDir, perspective) })
+  await ctx.session.wait({ sessionID })
+  const info = await ctx.session.get({ sessionID })
+  const outcome = info.outcome
+  const fresh = await readState(loopDir)
+  const filed = fresh.perspectiveVerdicts?.some(
+    (v) => v.perspective === perspective && v.attempt === state.attempt,
+  )
+  if (!filed) {
+    await appendEvents(loopDir, [
+      { event: "phase.incomplete", phase: "audit", perspective, attempt: state.attempt, outcome },
+    ])
+    throw new PhaseIncomplete(`the ${perspective} auditor ended without filing its perspective verdict`)
+  }
+  await appendEvents(loopDir, [
+    { event: "phase.submitted", phase: "audit", perspective, attempt: state.attempt },
+  ])
+}
+
+function perspectiveRecord(
+  config: LoopConfig,
+  state: PbaState,
+  perspective: string,
+): PerspectiveVerdictRecord | undefined {
+  return state.perspectiveVerdicts?.find(
+    (v) => v.perspective === perspective && v.attempt === state.attempt,
+  )
+}
+
+/** Deterministically merge the perspective verdicts; undefined until all are filed. */
+function mergePerspectiveVerdicts(
+  config: LoopConfig,
+  state: PbaState,
+): { verdict: PbaVerdict; findings: string[]; report: string } | undefined {
+  const records = config.auditPerspectives.map((p) => perspectiveRecord(config, state, p))
+  if (records.some((r) => r === undefined)) return undefined
+  const filed = records as PerspectiveVerdictRecord[]
+  const verdict: PbaVerdict = filed.every((r) => r.verdict === "approved") ? "approved" : "disapproved"
+  const findings = filed.flatMap((r) =>
+    r.findings.map((finding) => `[${r.perspective}] ${finding}`),
+  )
+  const table = filed
+    .map((r) => `- ${r.perspective}: ${r.verdict}${r.findings.length > 0 ? ` — ${r.findings.length} finding(s)` : ""}`)
+    .join("\n")
+  const report =
+    `# Audit review (attempt ${state.attempt})\n\nMerged verdict: **${verdict}**\n\n## Per-perspective outcomes\n\n${table}\n\n` +
+    filed.map((r) => `## ${r.perspective}\n\n${r.report}`).join("\n\n") +
+    "\n"
+  return { verdict, findings, report }
+}
+
+/**
+ * Audit phase: spawn one auditor session per missing perspective in parallel,
+ * then deterministically merge the perspective verdicts into review.md and a
+ * single VerdictRecord. Idempotent: only missing perspectives are spawned and
+ * the merged verdict is only written once per attempt.
+ */
+async function runAuditPhase(ctx: PluginContext, config: LoopConfig, state: PbaState): Promise<void> {
+  const loopDir = loopDirFor(config, state.loopId)
+  const missing = config.auditPerspectives.filter((p) => !perspectiveRecord(config, state, p))
+  if (missing.length > 0) {
+    await announce(
+      ctx,
+      state.originSessionID,
+      `🔎 **PBA \`${state.loopId}\`** — audit: ${missing.length} perspective auditor(s) starting (${missing.join(", ")}).`,
+    )
+    await Promise.all(missing.map((perspective) => runPerspectiveAudit(ctx, config, state, perspective)))
+  }
+  const fresh = await readState(loopDir)
+  if (config.auditPerspectives.some((p) => !perspectiveRecord(config, fresh, p))) {
+    throw new PhaseIncomplete("one or more auditors did not submit their perspective verdict")
+  }
+  const latest = latestVerdict(fresh)
+  if (latest?.attempt === fresh.attempt) return // already merged (retry/resume)
+  const merged = mergePerspectiveVerdicts(config, fresh)
+  if (!merged) {
+    throw new PhaseIncomplete("one or more auditors did not submit their perspective verdict")
+  }
+  await writeArtifact(loopDir, "review.md", merged.report)
+  await updateState(loopDir, (draft) => {
+    draft.verdicts.push({
+      attempt: draft.attempt,
+      verdict: merged.verdict,
+      findings: merged.findings,
+      report: merged.report,
+      at: now(),
+    })
+  })
+  await appendEvents(loopDir, [
+    {
+      event: "audit.merged",
+      attempt: fresh.attempt,
+      verdict: merged.verdict,
+      findings: merged.findings.length,
+      perspectives: config.auditPerspectives,
+    },
+  ])
 }
 
 async function announce(ctx: PluginContext, sessionID: string, text: string): Promise<void> {
@@ -317,19 +444,17 @@ async function runLoopTurns(ctx: PluginContext, config: LoopConfig, loopId: stri
       await announce(
         ctx,
         s.originSessionID,
-        `🔨 **PBA \`${loopId}\`** — build finished (attempt ${s.attempt}/${s.maxAttempts}): ${s.buildSummary ?? "no summary"}\nAuditor is starting.`,
+        `🔨 **PBA \`${loopId}\`** — build finished (attempt ${s.attempt}/${s.maxAttempts}): ${s.buildSummary ?? "no summary"}\naudit: ${config.auditPerspectives.length} perspective auditors starting (${config.auditPerspectives.join(", ")}).`,
       )
       continue
     }
 
     if (state.phase === "audit") {
-      if (state.submission?.kind !== "verdict") {
-        await runPhase(ctx, config, state, "audit", auditorPrompt(state, loopDir))
-      }
+      await runAuditPhase(ctx, config, state)
       const s = await readState(loopDir)
       const verdict = latestVerdict(s)
       if (!verdict) {
-        throw new PhaseIncomplete("auditor did not submit a verdict")
+        throw new PhaseIncomplete("auditors did not submit a merged verdict")
       }
 
       if (verdict.verdict === "approved") {
@@ -375,10 +500,14 @@ async function runLoopTurns(ctx: PluginContext, config: LoopConfig, loopId: stri
       })
       await appendEvents(loopDir, [{ event: "loop.revision", nextAttempt: s.attempt + 1 }])
       await rebuildIndex(config.rootDir, config.stateDirName)
+      const disapprovedBy = config.auditPerspectives.filter(
+        (p) => perspectiveRecord(config, s, p)?.verdict === "disapproved",
+      )
+      const byText = disapprovedBy.length > 0 ? `; disapproved by: ${disapprovedBy.join(", ")}` : ""
       await announce(
         ctx,
         s.originSessionID,
-        `🔁 **PBA \`${loopId}\`** — auditor disapproved (attempt ${s.attempt}/${s.maxAttempts}, ${verdict.findings.length} finding(s)). Sending findings back to the planner for revision.`,
+        `🔁 **PBA \`${loopId}\`** — auditor disapproved (attempt ${s.attempt}/${s.maxAttempts}, ${verdict.findings.length} finding(s)${byText}). Sending findings back to the planner for revision.`,
       )
       continue
     }

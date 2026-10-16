@@ -27,6 +27,20 @@ interface ToolArgs {
   [key: string]: unknown
 }
 
+/**
+ * In-process per-loop async mutex. Parallel perspective auditors file their
+ * `pba_verdict` calls concurrently against the same state.json; the lock
+ * serializes their read-modify-write cycles so no verdict record is lost.
+ */
+const loopLocks = new Map<string, Promise<unknown>>()
+
+function withLoopLock<T>(loopDir: string, fn: () => Promise<T>): Promise<T> {
+  const previous = loopLocks.get(loopDir) ?? Promise.resolve()
+  const next = previous.then(fn, fn)
+  loopLocks.set(loopDir, next.then(() => undefined, () => undefined))
+  return next
+}
+
 const strArray = {
   type: "array",
   items: { type: "string" },
@@ -231,13 +245,14 @@ export async function registerTools(
     editor.add({
       name: "pba_verdict",
       description:
-        "AUDITOR ONLY, mandatory final action: submit the audit decision. Writes review.md and drives the loop (approve = done, disapprove = back to the planner).",
+        "AUDITOR ONLY, mandatory final action: submit the audit decision. Pass the assigned `perspective` to write review-<perspective>.md as one of the parallel perspective auditors; omitting it is ONLY accepted for genuinely legacy loops without parallel audit state (in a parallel-audit loop the call fails with an error naming the `perspective` argument). Drives the loop (approve = done, disapprove = back to the planner).",
       input: {
         type: "object",
         properties: {
           verdict: { type: "string", enum: ["approved", "disapproved"], description: "approved = implementation meets the plan; disapproved = findings must be fixed." },
           report: { type: "string", description: "Full audit report in markdown: what was checked, what passed, what failed." },
           findings: { ...strArray, description: "Numbered, specific, actionable issues. Non-empty when disapproved; empty when approved." },
+          perspective: { type: "string", description: "Your assigned audit perspective (e.g. spec-adherence, bugs, security, code-quality). Required for parallel perspective auditors." },
         },
         required: ["verdict", "report", "findings"],
         additionalProperties: false,
@@ -248,6 +263,7 @@ export async function registerTools(
         const verdict = readString(args, "verdict")!
         const report = readString(args, "report")!
         const findings = readStringArray(args, "findings")!
+        const perspective = readString(args, "perspective", { optional: true })
         if (verdict !== "approved" && verdict !== "disapproved") {
           fail(`verdict must be "approved" or "disapproved", got "${verdict}"`)
         }
@@ -260,24 +276,75 @@ export async function registerTools(
 
         const { loopDir, state } = await resolveLoop(config, sessionLoops, context.sessionID)
         requirePhase(state, "audit", "pba_verdict")
-        await writeArtifact(loopDir, "review.md", report)
-        await updateState(loopDir, (draft) => {
-          draft.verdicts.push({
-            attempt: draft.attempt,
-            verdict,
-            findings,
-            report,
-            at: new Date().toISOString(),
-          })
-          draft.submission = { kind: "verdict", at: new Date().toISOString() }
-        })
-        await appendEvents(loopDir, [{ event: "verdict.submitted", verdict, findings: findings.length }])
-        return {
-          content:
-            verdict === "approved"
-              ? "Verdict recorded: APPROVED. The loop will finalize. Your phase is complete."
-              : `Verdict recorded: DISAPPROVED with ${findings.length} finding(s). The loop will send them back to the planner. Your phase is complete.`,
+        if (perspective !== undefined && !config.auditPerspectives.includes(perspective)) {
+          fail(
+            `unknown perspective "${perspective}" — configured perspectives: ${config.auditPerspectives.join(", ")}`,
+          )
         }
+        // Serialize concurrent perspective verdicts on the same state.json.
+        return withLoopLock(loopDir, async () => {
+          const fresh = await readState(loopDir)
+          requirePhase(fresh, "audit", "pba_verdict")
+          if (perspective !== undefined) {
+            if (!config.auditPerspectives.includes(perspective)) {
+              fail(
+                `unknown perspective "${perspective}" — configured perspectives: ${config.auditPerspectives.join(", ")}`,
+              )
+            }
+            if (fresh.perspectiveVerdicts?.some((v) => v.perspective === perspective && v.attempt === fresh.attempt)) {
+              fail(
+                `a "${perspective}" verdict for attempt ${fresh.attempt} is already recorded — do not call pba_verdict again`,
+              )
+            }
+            await writeArtifact(loopDir, `review-${perspective}.md`, report)
+            await updateState(loopDir, (draft) => {
+              draft.perspectiveVerdicts = [
+                ...(draft.perspectiveVerdicts ?? []),
+                { perspective, attempt: draft.attempt, verdict, findings, report, at: new Date().toISOString() },
+              ]
+              draft.submission = { kind: "verdict", at: new Date().toISOString() }
+            })
+            await appendEvents(loopDir, [
+              { event: "perspective.verdict", perspective, verdict, findings: findings.length, attempt: fresh.attempt },
+            ])
+            return {
+              content:
+                verdict === "approved"
+                  ? `Perspective verdict recorded: ${perspective} APPROVED (written to review-${perspective}.md). Your phase is complete.`
+                  : `Perspective verdict recorded: ${perspective} DISAPPROVED with ${findings.length} finding(s) (written to review-${perspective}.md). Your phase is complete.`,
+            }
+          }
+          // Legacy single-auditor path (kept for loops resumed from old
+          // state). Refuse it in parallel-audit loops: a stray verdict
+          // without a perspective would otherwise bypass the merge and let
+          // one session decide the loop outcome.
+          const isParallelAuditLoop =
+            Object.keys(fresh.sessions).some((k) => k.startsWith("audit:")) ||
+            (fresh.perspectiveVerdicts?.length ?? 0) > 0
+          if (isParallelAuditLoop) {
+            fail(
+              `this loop uses parallel perspective auditing — call pba_verdict with your assigned \`perspective\` argument (configured perspectives: ${config.auditPerspectives.join(", ")})`,
+            )
+          }
+          await writeArtifact(loopDir, "review.md", report)
+          await updateState(loopDir, (draft) => {
+            draft.verdicts.push({
+              attempt: draft.attempt,
+              verdict,
+              findings,
+              report,
+              at: new Date().toISOString(),
+            })
+            draft.submission = { kind: "verdict", at: new Date().toISOString() }
+          })
+          await appendEvents(loopDir, [{ event: "verdict.submitted", verdict, findings: findings.length }])
+          return {
+            content:
+              verdict === "approved"
+                ? "Verdict recorded: APPROVED. The loop will finalize. Your phase is complete."
+                : `Verdict recorded: DISAPPROVED with ${findings.length} finding(s). The loop will send them back to the planner. Your phase is complete.`,
+          }
+        })
       },
     })
   })
