@@ -1,15 +1,15 @@
 // Role prompts and prompt builders for the PBA loop.
 //
-// The three agents (pba-planner / pba-builder / pba-auditor) are defined as
-// markdown agents in `agents/` (mirrored inline in opencode.jsonc); their
-// markdown body is the *role* system prompt. What this module builds is the
-// *per-loop task prompt* the orchestrator sends when it spawns each phase
-// session.
+// Two subagent roles (pba-builder / pba-auditor) are defined as markdown
+// agents in `agents/` (mirrored inline in opencode.jsonc); their markdown body
+// is the *role* system prompt. What this module builds is the *per-loop task
+// prompt* the orchestrator sends when it runs each phase. The planner phase
+// has no agent: it runs in the origin (main) session, so plannerPrompt also
+// carries the read-only planner rules that used to live in the agent prompt.
 
 import type { PbaState } from "./state"
 
 export const AGENT_BY_ROLE = {
-  plan: "pba-planner",
   build: "pba-builder",
   audit: "pba-auditor",
 } as const
@@ -28,6 +28,7 @@ require, unless your analysis shows a finding is based on a misunderstanding
     : ""
 
   return `You are the PLANNER phase of PBA loop \`${state.loopId}\` (attempt ${state.attempt}/${state.maxAttempts}).
+You are acting in the main (origin) session — no planner subagent is spawned.
 Loop directory: ${loopDir}
 ${revisionBlock}
 ## Task spec (from the user)
@@ -48,6 +49,18 @@ ${state.spec}
    - \`tasks\`: ordered list of concrete implementation tasks.
    - \`acceptanceCriteria\`: checklist the auditor will use to approve or reject the build.
 
+## Planner rules
+
+- You are planning READ-ONLY. Never create or modify project files. Your only
+  output is the mandatory \`pba_plan_submit\` tool call (which writes plan.md
+  under the loop directory) plus read-only exploration.
+- Ground the plan in the real codebase: read the relevant files first, and name
+  concrete file paths and functions in the task breakdown.
+- Keep tasks ordered and small enough that a single session can execute them.
+- Acceptance criteria must be objectively checkable by an auditor ("the
+  middleware rejects requests over 100 req/min per key" — not "rate limiting
+  works well").
+${state.revision ? `- Address EVERY finding in ${loopDir}/review.md. Do not silently drop previous scope; if a finding conflicts with the original spec, call it out explicitly in the plan's "Notes" section.\n` : ""}
 Calling \`pba_plan_submit\` is MANDATORY and is how you finish this phase.
 Do not implement anything. Do not create or edit files outside the loop directory.`
 }
@@ -61,7 +74,12 @@ Loop directory: ${loopDir}
 1. Call the \`pba_state_read\` tool (no arguments) to load the current loop state.
 2. Read the plan at ${loopDir}/plan.md and implement it exactly${state.revision ? ", incorporating the fixes for the audit findings (see state and review.md)" : ""}.
 3. Keep the change minimal and focused on the plan. Do NOT commit to git.
-4. When implementation is complete, call the \`pba_build_complete\` tool with:
+4. NEVER restart, kill, or signal the OpenCode service/server process
+   (opencode, opencode.exe, bun serving the OpenCode API), and never run
+   commands that would terminate it (e.g. killall, pkill, service restarts).
+   Other live sessions depend on it. If you believe a restart is needed, do
+   NOT do it — report it in your \`pba_build_complete\` notes instead.
+5. When implementation is complete, call the \`pba_build_complete\` tool with:
    - \`summary\`: what you implemented and any deviations from the plan (with reasons).
    - \`changedFiles\`: list of files you created or modified.
    - \`notes\`: optional context for the auditor.
@@ -154,11 +172,15 @@ build is approved or the attempt budget is exhausted.
    - \`spec\`: the full task description (copy the user's request; expand or
      clarify if the user gave you a spec/proposal file, and note the source).
    - \`title\` (optional): short name for the loop; used in the loop ID.
-2. The tool returns a \`loopId\` immediately. The loop then runs in the
-   background and posts progress and the final verdict summary as messages in
-   this session.
-3. Do NOT try to run planner/builder/auditor yourself via the subagent tool,
-   and do not implement the change while a PBA loop for the same spec is
+2. After \`pba_start\`, **you (the calling session) are the planner** — no
+   planner subagent is spawned, so do NOT spawn one via the subagent tool.
+   The tool result contains the full procedure: call \`pba_state_read\`,
+   investigate the codebase read-only, then submit the plan with the
+   \`pba_plan_submit\` tool. That submission starts the loop: it hands the
+   plan to a builder subagent and runs build → audit in the background,
+   posting progress and the final verdict summary as messages in this session.
+3. Do NOT try to run builder/auditor yourself via the subagent tool, and do
+   not implement the change yourself while a PBA loop for the same spec is
    active — the loop handles it.
 
 ## Checking on it

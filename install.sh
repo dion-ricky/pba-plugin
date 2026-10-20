@@ -46,7 +46,7 @@ if ! command -v node >/dev/null 2>&1; then
   echo "error: 'node' is required on PATH to run this installer." >&2
   exit 1
 fi
-if [[ ! -f "${AGENTS_DIR}/pba-planner.md" ]]; then
+if [[ ! -f "${AGENTS_DIR}/pba-builder.md" ]]; then
   echo "error: agent definitions not found at ${AGENTS_DIR} — the agents/ folder must sit next to install.sh." >&2
   exit 1
 fi
@@ -62,7 +62,7 @@ const PLUGIN_DIR = process.env.PLUGIN_DIR
 const AGENTS_DIR = process.env.AGENTS_DIR
 const COPY_MODE = process.env.COPY_MODE === "1"
 
-const ROLE_IDS = ["pba-planner", "pba-builder", "pba-auditor"]
+const ROLE_IDS = ["pba-builder", "pba-auditor"]
 
 // --- JSONC handling ---------------------------------------------------------
 

@@ -1,10 +1,14 @@
 // Command surface: /pba, /pba-status, /pba-resume.
 //
 // Commands return immediately; the loop itself runs in the background and
-// posts progress to the invoking session via synthetic messages.
+// posts progress to the invoking session via synthetic messages. The planner
+// phase runs in the invoking (main) session: /pba hands the planner role to
+// that session by prompting it with the planner hand-off.
 
 import type { Context as PluginContext } from "@opencode/plugin/promise/plugin"
 import { resumeLoop, startLoop, statusReport, type LoopConfig } from "./orchestrator"
+import { loopDirOf, readState } from "./state"
+import { plannerPrompt } from "./prompts"
 import type { SessionLoopMap } from "./tools"
 
 async function notify(ctx: PluginContext, sessionID: string, text: string): Promise<void> {
@@ -37,11 +41,25 @@ export async function registerCommands(
         try {
           const loopId = await startLoop(ctx, config, { spec, originSessionID: sessionID })
           sessionLoops.set(sessionID, loopId)
-          await notify(
-            ctx,
-            sessionID,
-            `🔁 **PBA loop \`${loopId}\` started** — planner is working on: _${spec.slice(0, 120)}${spec.length > 120 ? "…" : ""}_\nProgress will be posted here. Check with \`/pba-status\`.`,
-          )
+          // Planning happens in this (main) session: prompt it with the
+          // planner hand-off. If the prompt fails (e.g. session gone), fall
+          // back to a synthetic notify with the instructions.
+          const loopDir = loopDirOf(config.rootDir, config.stateDirName, loopId)
+          const state = await readState(loopDir)
+          const handoff =
+            `🔁 **PBA loop \`${loopId}\` started** — planning happens in this session: _${spec.slice(0, 120)}${spec.length > 120 ? "…" : ""}_\n\n` +
+            plannerPrompt(state, loopDir) +
+            `\n\nCheck on the loop with /pba-status.`
+          try {
+            await ctx.session.prompt({ sessionID, text: handoff })
+          } catch (cause) {
+            console.error(`[pba] could not prompt session ${sessionID} with the planner hand-off: ${(cause as Error).message}`)
+            await notify(
+              ctx,
+              sessionID,
+              `🔁 **PBA loop \`${loopId}\` started** — you are the PLANNER: call \`pba_state_read\`, investigate the codebase read-only, then submit the plan with \`pba_plan_submit\`. Planning happens in this session; no planner subagent is spawned.\nCheck with \`/pba-status\`.`,
+            )
+          }
         } catch (cause) {
           await notify(ctx, sessionID, `❌ Could not start PBA loop: ${(cause as Error).message}`)
         }

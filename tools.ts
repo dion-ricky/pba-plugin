@@ -19,7 +19,8 @@ import {
   type LoopRecord,
   type PbaState,
 } from "./state"
-import { startLoop, statusReport as renderStatus, type LoopConfig } from "./orchestrator"
+import { startLoop, driveLoop, statusReport as renderStatus, type LoopConfig } from "./orchestrator"
+import { plannerPrompt } from "./prompts"
 
 export type SessionLoopMap = Map<string, string>
 
@@ -106,7 +107,7 @@ export async function registerTools(
     editor.add({
       name: "pba_start",
       description:
-        "Start a plan-build-audit (PBA) loop: a planner writes a plan, a builder implements it, and an auditor reviews it; disapproval sends work back to the planner. Runs in the background; returns the loopId immediately. Use for non-trivial changes the user wants planned, built, and audited.",
+        "Start a plan-build-audit (PBA) loop. The planner phase runs in the calling session: after start, plan and submit the plan with pba_plan_submit, then the loop hands the plan to a builder subagent; an auditor reviews it and disapproval sends work back to the planner. Use for non-trivial changes the user wants planned, built, and audited.",
       input: {
         type: "object",
         properties: {
@@ -128,10 +129,13 @@ export async function registerTools(
           originSessionID: context.sessionID,
         })
         sessionLoops.set(context.sessionID, loopId)
+        const loopDir = loopDirOf(config.rootDir, config.stateDirName, loopId)
+        const state = await readState(loopDir)
         return {
           content:
-            `PBA loop \`${loopId}\` started (planner phase). Progress and the final verdict will be posted to this session. ` +
-            `State: ${loopDirOf(config.rootDir, config.stateDirName, loopId)}. Check on it with pba_status or /pba-status.`,
+            `PBA loop \`${loopId}\` started. You are the PLANNER for this loop — planning happens in this session.\n\n` +
+            plannerPrompt(state, loopDir) +
+            `\n\nCheck on the loop with pba_status or /pba-status.`,
         }
       },
     })
@@ -196,6 +200,11 @@ export async function registerTools(
 
         const { loopDir, state } = await resolveLoop(config, sessionLoops, context.sessionID)
         requirePhase(state, "plan", "pba_plan_submit")
+        if (state.submission?.kind === "plan") {
+          fail(
+            `plan already submitted for attempt ${state.attempt} — do not call pba_plan_submit again`,
+          )
+        }
         await writeArtifact(loopDir, "plan.md", plan)
         await updateState(loopDir, (draft) => {
           draft.planSummary = summary
@@ -204,7 +213,11 @@ export async function registerTools(
           draft.submission = { kind: "plan", at: new Date().toISOString() }
         })
         await appendEvents(loopDir, [{ event: "plan.submitted", tasks: tasks.length, criteria: criteria.length }])
-        return { content: "Plan submitted and saved to plan.md. The loop will now start the builder. Your phase is complete." }
+        // The plan is persisted: hand control to the loop driver, which hands
+        // the plan to the builder subagent. Fire-and-forget; the activeLoops
+        // guard makes a double kick (e.g. during a revision drive) a no-op.
+        void driveLoop(ctx, config, state.loopId)
+        return { content: "Plan submitted and saved to plan.md. The builder subagent is starting in the background; progress will be posted to this session. Your phase is complete." }
       },
     })
 

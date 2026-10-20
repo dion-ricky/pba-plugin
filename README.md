@@ -1,8 +1,9 @@
 # pba — plan-build-audit loop plugin for OpenCode V2
 
 A supervised implementation loop: a **planner** turns your request into a
-plan, a **builder** implements it, and an independent **auditor** approves the
-result or sends findings back to the planner. The loop is driven entirely by
+plan (in your own session — no planner subagent), a **builder** implements it
+as a spawned subagent, and independent **auditor** subagents approve the
+result or send findings back to the planner. The loop is driven entirely by
 the plugin from persisted state — the models only file artifacts, they never
 decide control flow.
 
@@ -42,6 +43,11 @@ Natural language works too: ask your primary agent to "run the PBA loop for
 …" — the `pba-loop` skill teaches it to call the `pba_start` tool. Progress
 and the final verdict are posted to your session as messages.
 
+**Planning happens in your session**: after `pba_start` (or `/pba`), the
+calling session itself is the planner — it investigates the codebase
+read-only and submits the plan with `pba_plan_submit`. Only then does the
+loop start the builder and auditor subagents in the background.
+
 ## Coordination state (per repo)
 
 Everything lives under `.pba/` in the repo where the loop is started; each
@@ -75,7 +81,7 @@ bash /path/to/pba-plugin/install.sh /path/to/project
 bash /path/to/pba-plugin/install.sh /path/to/project --copy
 ```
 
-The script reads the three `pba-*.md` agent definitions (single source of
+The script reads the two `pba-*.md` agent definitions (single source of
 truth), converts them to `agents` config entries, adds the plugin to `plugins`,
 and writes or merges the target's `opencode.json(c)` — existing config is
 backed up first, and an unparseable config aborts with a manual-merge snippet.
@@ -88,7 +94,7 @@ The equivalent config, if you prefer doing it by hand:
   "plugins": [{ "package": "/absolute/path/to/pba-plugin" }]
 }
 ```
-plus the three agents under `agents` (exactly what `install.sh` generates).
+plus the two agents under `agents` (exactly what `install.sh` generates).
 
 ## Configuration (optional)
 
@@ -104,10 +110,11 @@ plus the three agents under `agents` (exactly what `install.sh` generates).
           "spec-adherence", "bugs", "security", "code-quality"
         ],
         "models": {              // optional per-role overrides ("provider/model")
-          "plan": "anthropic/claude-sonnet-4-5",
           "build": "anthropic/claude-sonnet-4-5",
           "audit": "anthropic/claude-sonnet-4-5"
         }
+        // no "plan" override: planning runs in the main session, which keeps
+        // its own model (a stale "plan" key fails fast with a clear error)
       }
     }
   ]
@@ -120,23 +127,27 @@ the options block is only needed to change defaults.
 
 ## Roles
 
-The three role agents are markdown files in this repo's `agents/` directory
-(`pba-planner`, `pba-builder`, `pba-auditor`); `install.sh` converts them into
-the target project's `agents` config.
+The planner runs in **your session** (the one that called `pba_start` or
+`/pba`) — it needs no agent definition because it keeps your session's own
+permissions and model. The two subagent roles are markdown files in this
+repo's `agents/` directory (`pba-builder`, `pba-auditor`); `install.sh`
+converts them into the target project's `agents` config.
 
-**Model selection** for phase sessions, in priority order:
+**Model selection** for spawned phase sessions, in priority order:
 
 1. explicit `options.models.<role>` override (see Configuration), else
 2. the origin session's selected model — variant included — so a loop started
-   from a session running e.g. `ai-gateway/glm-5.3-flash#high` runs all phases
-   on exactly that model, else
+   from a session running e.g. `ai-gateway/glm-5.3-flash#high` runs all
+   spawned phases on exactly that model, else
 3. OpenCode's configured default model.
 
-| Agent | System prompt | Guardrails |
+The planner uses the main session's own model by definition.
+
+| Role | Where it runs | Guardrails |
 |---|---|---|
-| `pba-planner` | Grounds the spec in the codebase, writes `plan.md` with tasks + acceptance criteria | edit denied |
-| `pba-builder` | Implements the plan exactly, minimal diff, no commits | — |
-| `pba-auditor` | Reviews the diff against every task/criterion, runs read-only checks | edit denied, `git diff/status/log/show` allowed |
+| planner (no agent) | your session, prompted in place by the loop | read-only discipline via the planner prompt; files `plan.md` via `pba_plan_submit` |
+| `pba-builder` | spawned subagent session | implements the plan exactly, minimal diff, no commits |
+| `pba-auditor` | spawned subagent session (one per perspective) | edit denied, `git diff/status/log/show` allowed |
 
 Each role must finish with its mandatory structured submission tool
 (`pba_plan_submit` / `pba_build_complete` / `pba_verdict`). Verdicts are

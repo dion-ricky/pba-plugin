@@ -1,4 +1,9 @@
 // End-to-end smoke test of the PBA loop with a mocked plugin context.
+// The plan phase runs in the origin (main) session: each scenario simulates
+// it by executing `pba_plan_submit` as `ses_origin` after `startLoop` — which
+// is also what kicks off the loop driver. Revision/resume re-plans are
+// prompted to the origin session by the driver and dispatched to the mock
+// script by role (via state.sessions, where sessions.plan === ses_origin).
 // Simulates the role agents (including one auditor session per audit
 // perspective) by invoking the registered submission tools exactly as real
 // sessions would, then asserts the loop's state machine behavior: approval,
@@ -26,7 +31,6 @@ function check(name: string, condition: boolean, detail = "") {
 }
 
 const AGENT_TO_ROLE: Record<string, string> = {
-  "pba-planner": "plan",
   "pba-builder": "build",
   "pba-auditor": "audit",
 }
@@ -143,7 +147,12 @@ async function waitForSynthetic(synthetics: string[], needle: string, timeoutMs 
   }
 }
 
-async function submitPlan(tools: Map<string, ToolDef>, sessions: Map<string, string>) {
+/**
+ * Simulate the main-session planner: execute `pba_plan_submit` as the given
+ * session (the origin session on the fresh hand-off; the driver prompts the
+ * same session again for revision re-plans).
+ */
+async function submitPlan(tools: Map<string, ToolDef>, sessionID: string) {
   const result = await tools.get("pba_plan_submit")!.execute(
     {
       plan: "# Plan\nDo the thing.\n\n## Tasks\n1. Do it",
@@ -151,7 +160,7 @@ async function submitPlan(tools: Map<string, ToolDef>, sessions: Map<string, str
       tasks: ["Do the thing in src/thing.ts"],
       acceptanceCriteria: ["src/thing.ts exists and does the thing"],
     },
-    toolContext(sessions.get("plan")!),
+    toolContext(sessionID),
   )
   return result.content
 }
@@ -243,7 +252,7 @@ await scenario("approve-first-attempt", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
     },
@@ -252,6 +261,9 @@ await scenario("approve-first-attempt", async (root) => {
   await registerTools(mock.ctx as never, config, sessionLoops)
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("status completed", final.status === "completed", final.status)
@@ -264,7 +276,7 @@ await scenario("approve-first-attempt", async (root) => {
   check("origin notified", mock.synthetics.some((t) => t.includes("completed")), mock.synthetics.join(" // "))
   check(
     "phase sessions inherit origin model (incl. variant)",
-    mock.createdModels.length === 6 &&
+    mock.createdModels.length === 5 &&
       mock.createdModels.every((m) => m?.providerID === "mock" && m.id === "mock-main" && m.variant === "high"),
     JSON.stringify(mock.createdModels),
   )
@@ -275,7 +287,7 @@ await scenario("explicit-model-override-wins", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3, models: { audit: "gateway/audit-model" } })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
     },
@@ -285,15 +297,17 @@ await scenario("explicit-model-override-wins", async (root) => {
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
 
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
+
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("override scenario completes", final.status === "completed", final.status)
-  const auditModels = mock.createdModels.slice(2)
+  const auditModels = mock.createdModels.slice(1)
   check(
-    "planner/builder inherit origin model, all perspective auditors use override",
-    mock.createdModels.length === 6 &&
+    "builder inherits origin model, all perspective auditors use override",
+    mock.createdModels.length === 5 &&
       mock.createdModels[0]?.id === "mock-main" &&
       mock.createdModels[0]?.variant === "high" &&
-      mock.createdModels[1]?.id === "mock-main" &&
       auditModels.length === 4 &&
       auditModels.every((m) => m?.id === "audit-model" && m?.providerID === "gateway"),
     JSON.stringify(mock.createdModels),
@@ -305,7 +319,7 @@ await scenario("revision-then-approve", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
         await filePerspectiveVerdict(tools, sessionID, (p, at) =>
@@ -325,6 +339,9 @@ await scenario("revision-then-approve", async (root) => {
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
 
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
+
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("completed on attempt 2", final.status === "completed" && final.attempt === 2, `${final.status} attempt=${final.attempt}`)
   check("two merged verdicts recorded", final.verdicts.length === 2)
@@ -338,7 +355,7 @@ await scenario("escalate-at-max-attempts", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 2 })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
         await filePerspectiveVerdict(tools, sessionID, (p) => ({
@@ -354,6 +371,9 @@ await scenario("escalate-at-max-attempts", async (root) => {
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
 
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
+
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("escalated", final.status === "escalated", final.status)
   check("stopped at maxAttempts", final.attempt === 2 && final.maxAttempts === 2)
@@ -362,12 +382,15 @@ await scenario("escalate-at-max-attempts", async (root) => {
   check("origin notified of escalation", true)
 })
 
-// -- 4. Session ends without submitting: one retry, then fail ----------------
+// -- 4. Orchestrated plan phase without a submission: one retry, then fail ---
+// startLoop no longer drives anything; the orchestrated plan phase (which
+// prompts the origin session) is triggered here via resumeLoop. The mock
+// origin session submits nothing -> one retry -> failed.
 await scenario("incomplete-phase-retry-then-fail", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
     act: async () => {
-      /* agent never calls its submission tool */
+      /* the origin session never calls its submission tool */
     },
   })
   const sessionLoops: SessionLoopMap = new Map()
@@ -375,12 +398,12 @@ await scenario("incomplete-phase-retry-then-fail", async (root) => {
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
 
+  await resumeLoop(mock.ctx as never, config, loopId, "ses_origin")
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("failed", final.status === "failed", final.status)
   check(
     "error mentions missing submission",
-    (final.lastError ?? "").includes("without calling its mandatory submission tool") ||
-      (final.lastError ?? "").includes("without filing its perspective verdict"),
+    (final.lastError ?? "").includes("without calling its mandatory submission tool"),
     final.lastError ?? "",
   )
   await waitForSynthetic(mock.synthetics, "failed")
@@ -394,7 +417,7 @@ await scenario("resume-recovers", async (root) => {
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
       if (!behave) return
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
     },
@@ -403,6 +426,10 @@ await scenario("resume-recovers", async (root) => {
   await registerTools(mock.ctx as never, config, sessionLoops)
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  // First resume runs the orchestrated plan phase; the origin session
+  // (behave = false) submits nothing -> one retry -> loop fails.
+  await resumeLoop(mock.ctx as never, config, loopId, "ses_origin")
   await waitFor(currentLoopDir, ["failed"])
 
   behave = true
@@ -438,6 +465,22 @@ await scenario("tool-phase-guards", async (root) => {
   })
   const st = await state.readState(loopDir)
   void st
+
+  // A plan already submitted for the current attempt is rejected (prevents a
+  // double-submit racing the phase transition).
+  await state.updateState(loopDir, (draft) => {
+    draft.submission = { kind: "plan", at: new Date().toISOString() }
+  })
+  let doubleErr = ""
+  try {
+    await mock.tools.get("pba_plan_submit")!.execute(
+      { plan: "p", summary: "s", tasks: ["t"], acceptanceCriteria: ["a"] },
+      toolContext("ses_origin"),
+    )
+  } catch (cause) {
+    doubleErr = (cause as Error).message
+  }
+  check("double plan submit rejected", doubleErr.includes("already submitted"), doubleErr)
 
   let verdictErr = ""
   try {
@@ -501,6 +544,18 @@ await scenario("config-validation", async (root) => {
 
   err = ""
   try {
+    resolveConfig(root, { models: { plan: "any/thing" } } as never)
+  } catch (cause) {
+    err = (cause as Error).message
+  }
+  check(
+    "models.plan rejected (planning runs in the main session)",
+    err.includes("planning runs in the main session"),
+    err,
+  )
+
+  err = ""
+  try {
     resolveConfig(root, { auditPerspectives: [] })
   } catch (cause) {
     err = (cause as Error).message
@@ -528,7 +583,7 @@ await scenario("all-perspectives-approve", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") await filePerspectiveVerdict(tools, sessionID, (p) => allApprove(p))
     },
@@ -537,6 +592,9 @@ await scenario("all-perspectives-approve", async (root) => {
   await registerTools(mock.ctx as never, config, sessionLoops)
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("loop completed", final.status === "completed", final.status)
@@ -560,7 +618,7 @@ await scenario("one-perspective-disapproves", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
         await filePerspectiveVerdict(tools, sessionID, (p, at) =>
@@ -579,6 +637,9 @@ await scenario("one-perspective-disapproves", async (root) => {
   await registerTools(mock.ctx as never, config, sessionLoops)
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("completed on revision", final.status === "completed" && final.attempt === 2, `${final.status} attempt=${final.attempt}`)
@@ -601,7 +662,7 @@ await scenario("missing-perspective-verdict-retried", async (root) => {
   let skippedOnce = false
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
         const s = await state.readState(currentLoopDir!)
@@ -620,6 +681,9 @@ await scenario("missing-perspective-verdict-retried", async (root) => {
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
 
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
+
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("completed after retry", final.status === "completed", `${final.status}: ${final.lastError ?? ""}`)
   const counts: Record<string, number> = {}
@@ -634,7 +698,7 @@ await scenario("concurrent-verdicts-not-lost", async (root) => {
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
         // Interleave the parallel verdict submissions before the state
@@ -648,6 +712,9 @@ await scenario("concurrent-verdicts-not-lost", async (root) => {
   await registerTools(mock.ctx as never, config, sessionLoops)
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("completed", final.status === "completed", `${final.status}: ${final.lastError ?? ""}`)
@@ -665,7 +732,7 @@ await scenario("stray-legacy-verdict-rejected-in-parallel-audit", async (root) =
   const config = resolveConfig(root, { stateDir: ".pba", maxAttempts: 3 })
   const mock = makeMockCtx({
     act: async (role, sessionID, attempt, tools, sessions) => {
-      if (role === "plan") await submitPlan(tools, sessions)
+      if (role === "plan") await submitPlan(tools, sessionID)
       if (role === "build") await submitBuild(tools, sessions, attempt)
       if (role === "audit") {
         const s = await state.readState(currentLoopDir!)
@@ -695,6 +762,9 @@ await scenario("stray-legacy-verdict-rejected-in-parallel-audit", async (root) =
   await registerTools(mock.ctx as never, config, sessionLoops)
   const loopId = await startLoop(mock.ctx as never, config, { spec: "Do the thing", originSessionID: "ses_origin" })
   currentLoopDir = state.loopDirOf(root, ".pba", loopId)
+
+  // Simulate the main-session planner: submitting the plan kicks the driver.
+  await submitPlan(mock.tools, "ses_origin")
 
   const final = await waitFor(currentLoopDir, ["completed", "failed", "escalated"])
   check("loop completed despite stray legacy call", final.status === "completed", `${final.status}: ${final.lastError ?? ""}`)

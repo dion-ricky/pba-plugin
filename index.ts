@@ -8,10 +8,11 @@
 //   Skill:     "pba-loop" so primary agents know how to trigger the loop
 //              in natural language.
 //
-// The three role agents (pba-planner / pba-builder / pba-auditor) are markdown
-// agents in `agents/` (mirrored inline in opencode.jsonc) — the plugin spawns
-// them as child sessions and drives the loop deterministically from persisted
-// state under `.pba/`.
+// The two role agents (pba-builder / pba-auditor) are markdown agents in
+// `agents/` (mirrored inline in opencode.jsonc) — the plugin spawns them as
+// child sessions and drives the loop deterministically from persisted state
+// under `.pba/`. The planner phase has no agent: it runs in the main (origin)
+// session, which plans in place and submits via `pba_plan_submit`.
 //
 // Configuration via opencode.json(c):
 //   {
@@ -25,10 +26,9 @@
 //             "spec-adherence", "bugs", "security", "code-quality"
 //           ],
 //           "models": {                // optional per-role model overrides
-//             "plan": "provider/model",
 //             "build": "provider/model",
 //             "audit": "provider/model"
-//           }
+//           }                          // planning runs in the main session, which keeps its own model
 //         }
 //       }
 //     ]
@@ -45,7 +45,8 @@ import { registerTools, type SessionLoopMap } from "./tools"
 export interface PbaPluginOptions {
   stateDir?: string
   maxAttempts?: number
-  models?: { plan?: string; build?: string; audit?: string }
+  /** Optional per-role model override; planning runs in the main session, which keeps its own model. */
+  models?: { build?: string; audit?: string }
   /** Perspectives reviewed in parallel during the audit phase (default: spec-adherence, bugs, security, code-quality). */
   auditPerspectives?: string[]
 }

@@ -29,8 +29,11 @@ export interface PbaOptions {
   stateDir?: string
   /** Maximum build attempts before the loop escalates to the user. */
   maxAttempts?: number
-  /** Optional per-role model override as "provider/model". */
-  models?: { plan?: string; build?: string; audit?: string }
+  /**
+   * Optional per-role model override as "provider/model". Planning has no
+   * override: it runs in the main session, which keeps its own model.
+   */
+  models?: { build?: string; audit?: string }
   /** Perspectives reviewed in parallel during the audit phase. */
   auditPerspectives?: string[]
 }
@@ -39,22 +42,30 @@ export interface LoopConfig {
   rootDir: string
   stateDirName: string
   maxAttempts: number
-  models: { plan?: string; build?: string; audit?: string }
+  models: { build?: string; audit?: string }
   auditPerspectives: string[]
 }
 
 export function resolveConfig(rootDir: string, options: PbaOptions | undefined): LoopConfig {
-  const models = options?.models ?? {}
+  // Read loosely: runtime configs come from opencode.json(c), where a stale
+  // `models.plan` key may still be present and must be rejected loudly.
+  const rawModels = (options?.models ?? {}) as { plan?: string; build?: string; audit?: string }
   const maxAttempts = options?.maxAttempts ?? 3
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
     throw new Error(`[pba] options.maxAttempts must be a positive integer, got ${JSON.stringify(options?.maxAttempts)}`)
   }
-  for (const role of ["plan", "build", "audit"] as const) {
-    const ref = models[role]
+  if (rawModels.plan !== undefined) {
+    throw new Error(
+      "[pba] options.models.plan is no longer supported: planning runs in the main session, which keeps its own model",
+    )
+  }
+  for (const role of ["build", "audit"] as const) {
+    const ref = rawModels[role]
     if (ref !== undefined && !/^[^/]+\/[^/]+$/.test(ref)) {
       throw new Error(`[pba] options.models.${role} must look like "provider/model", got "${ref}"`)
     }
   }
+  const models: LoopConfig["models"] = { build: rawModels.build, audit: rawModels.audit }
   const auditPerspectives = options?.auditPerspectives ?? [...DEFAULT_PERSPECTIVES]
   const invalid = !Array.isArray(auditPerspectives) ||
     auditPerspectives.length === 0 ||
@@ -88,11 +99,17 @@ export function isLoopActive(loopId: string): boolean {
   return activeLoops.has(loopId)
 }
 
+/**
+ * Roles that run in spawned child sessions. Planning is the exception: it runs
+ * in the origin (main) session, which is prompted in place instead.
+ */
+type SpawnRole = Exclude<PbaRole, "plan">
+
 async function spawnPhaseSession(
   ctx: PluginContext,
   config: LoopConfig,
   state: PbaState,
-  role: PbaRole,
+  role: SpawnRole,
   sessionKey?: PbaRole | `audit:${string}`,
 ): Promise<string> {
   // Model resolution order: explicit per-role override > the origin (main)
@@ -131,7 +148,7 @@ async function runPhase(
   ctx: PluginContext,
   config: LoopConfig,
   state: PbaState,
-  role: PbaRole,
+  role: SpawnRole,
   promptText: string,
 ): Promise<void> {
   const loopDir = loopDirFor(config, state.loopId)
@@ -149,6 +166,37 @@ async function runPhase(
     )
   }
   await appendEvents(loopDir, [{ event: "phase.submitted", phase: role, attempt: state.attempt }])
+}
+
+/**
+ * Plan phase in the origin (main) session: no child session is spawned. The
+ * origin session is prompted with the planner hand-off and must file its plan
+ * via `pba_plan_submit`, mirroring `runPhase` without the spawn.
+ */
+async function runPlannerInOriginSession(
+  ctx: PluginContext,
+  config: LoopConfig,
+  state: PbaState,
+): Promise<void> {
+  const loopDir = loopDirFor(config, state.loopId)
+  const sessionID = state.originSessionID
+  await appendEvents(loopDir, [{ event: "phase.start", phase: "plan", attempt: state.attempt, sessionID }])
+  try {
+    await ctx.session.prompt({ sessionID, text: plannerPrompt(state, loopDir) })
+  } catch (cause) {
+    throw new Error(
+      `[pba] could not prompt the origin session ${sessionID} with the planner hand-off: ${(cause as Error).message}`,
+    )
+  }
+  await ctx.session.wait({ sessionID })
+  const fresh = await readState(loopDir)
+  if (fresh.submission?.kind !== EXPECTED_SUBMISSION.plan) {
+    await appendEvents(loopDir, [{ event: "phase.incomplete", phase: "plan", attempt: state.attempt }])
+    throw new PhaseIncomplete(
+      "the origin session finished the plan phase without calling its mandatory submission tool (pba_plan_submit)",
+    )
+  }
+  await appendEvents(loopDir, [{ event: "phase.submitted", phase: "plan", attempt: state.attempt }])
 }
 
 /** One parallel perspective auditor session; must file its perspective verdict. */
@@ -282,8 +330,10 @@ export interface StartLoopInput {
 }
 
 /**
- * Create the loop's coordination state and start driving it in the background.
- * Returns the loopId immediately; callers surface it to the user right away.
+ * Create the loop's coordination state and return the loopId. The planner
+ * phase runs in the origin (main) session: the caller hands the planner role
+ * to that session, and the driver is started when the plan is submitted
+ * (`pba_plan_submit` fires `driveLoop`).
  */
 export async function startLoop(
   ctx: PluginContext,
@@ -311,7 +361,9 @@ export async function startLoop(
     maxAttempts: config.maxAttempts,
     phaseRetries: 0,
     revision: false,
-    sessions: {},
+    // The planner runs in the origin session; recording it here keeps
+    // findLoopBySession and role lookups working for the plan phase.
+    sessions: { plan: input.originSessionID },
     submission: null,
     planSummary: null,
     tasks: [],
@@ -326,8 +378,6 @@ export async function startLoop(
   await writeState(loopDir, state)
   await appendEvents(loopDir, [{ event: "loop.created", title, originSessionID: input.originSessionID }])
   await rebuildIndex(config.rootDir, config.stateDirName)
-
-  void driveLoop(ctx, config, loopId)
   return loopId
 }
 
@@ -362,8 +412,10 @@ export async function resumeLoop(
  * Drive the loop until it reaches a terminal state (completed/escalated/failed)
  * or pauses. A single loop is driven at most once per plugin instance; resume
  * paths re-enter safely because terminal and in-flight states are checked here.
+ * Exported so the `pba_plan_submit` tool can kick the driver once the main
+ * session files its plan (startLoop no longer starts it).
  */
-async function driveLoop(ctx: PluginContext, config: LoopConfig, loopId: string): Promise<void> {
+export async function driveLoop(ctx: PluginContext, config: LoopConfig, loopId: string): Promise<void> {
   if (activeLoops.has(loopId)) return
   activeLoops.add(loopId)
   try {
@@ -407,7 +459,7 @@ async function runLoopTurns(ctx: PluginContext, config: LoopConfig, loopId: stri
 
     if (state.phase === "plan") {
       if (state.submission?.kind !== "plan") {
-        await runPhase(ctx, config, state, "plan", plannerPrompt(state, loopDir))
+        await runPlannerInOriginSession(ctx, config, state)
       }
       const s = await readState(loopDir)
       if (s.submission?.kind !== "plan") {
