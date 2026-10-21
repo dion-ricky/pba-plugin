@@ -28,7 +28,14 @@
 //           "models": {                // optional per-role model overrides
 //             "build": "provider/model",
 //             "audit": "provider/model"
-//           }                          // planning runs in the main session, which keeps its own model
+//           },                         // planning runs in the main session, which keeps its own model
+//           "control": "subagent",     // or "herdr": run builder/auditor sessions as full OpenCode
+//                                      // TUIs in herdr panes (requires the herdr CLI and OpenCode
+//                                      // running inside a herdr pane; failure paths stay on-disk)
+//           "herdr": {                 // tuning for control:"herdr"
+//             "ratio": 0.5,            // builder pane split ratio
+//             "promptTimeoutMs": 600000
+//           }
 //         }
 //       }
 //     ]
@@ -49,6 +56,14 @@ export interface PbaPluginOptions {
   models?: { build?: string; audit?: string }
   /** Perspectives reviewed in parallel during the audit phase (default: spec-adherence, bugs, security, code-quality). */
   auditPerspectives?: string[]
+  /**
+   * How role sessions are driven: "subagent" (default) spawns plugin child
+   * sessions; "herdr" launches full OpenCode TUIs in herdr panes via the
+   * herdr CLI (requires OpenCode to run inside herdr).
+   */
+  control?: "subagent" | "herdr"
+  /** herdr driver tuning; only used when control is "herdr". */
+  herdr?: { ratio?: number; promptTimeoutMs?: number }
 }
 
 export default Plugin.define({

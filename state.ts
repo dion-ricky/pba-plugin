@@ -46,6 +46,13 @@ export type PbaSessions = Partial<Record<PbaRole, string>> & {
   [auditPerspective: `audit:${string}`]: string
 }
 
+/** herdr pane bookkeeping for one role session (only when a loop runs with control:"herdr"). */
+export interface HerdrPaneRecord {
+  paneId: string
+  agent: string
+  nativeSessionID?: string
+}
+
 export interface PbaState {
   version: 1
   loopId: string
@@ -61,6 +68,8 @@ export interface PbaState {
   phaseRetries: number
   revision: boolean
   sessions: PbaSessions
+  /** Per-role-key herdr pane info when the loop runs with control:"herdr" (absent in subagent mode and older state files). */
+  herdrPanes?: Record<string, HerdrPaneRecord>
   submission: { kind: PbaSubmissionKind; at: string } | null
   planSummary: string | null
   tasks: string[]

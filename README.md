@@ -21,6 +21,7 @@ pba-plugin/
   index.ts            plugin entry: registers tools, commands, skill
   state.ts            coordination store (JSON + markdown; SQLite swap touches only this)
   orchestrator.ts     deterministic loop driver
+  herdr.ts            herdr CLI adapter (opt-in control:"herdr" mode)
   tools.ts            pba_start / pba_status / pba_state_read / submission tools
   commands.ts         /pba, /pba-status, /pba-resume
   prompts.ts          per-phase task prompts + skill content
@@ -112,9 +113,15 @@ plus the two agents under `agents` (exactly what `install.sh` generates).
         "models": {              // optional per-role overrides ("provider/model")
           "build": "anthropic/claude-sonnet-4-5",
           "audit": "anthropic/claude-sonnet-4-5"
-        }
+        },
         // no "plan" override: planning runs in the main session, which keeps
         // its own model (a stale "plan" key fails fast with a clear error)
+        "control": "subagent",   // or "herdr": run builder/auditor sessions as
+                                 // full OpenCode TUIs in herdr panes (see below)
+        "herdr": {               // tuning for control:"herdr"
+          "ratio": 0.5,          // audit column width only; range-limited to [0.1,0.9]
+          "promptTimeoutMs": 600000
+        }
       }
     }
   ]
@@ -124,6 +131,46 @@ plus the two agents under `agents` (exactly what `install.sh` generates).
 The plugin auto-loads without config when vendored under `.opencode/plugins/`
 or when installed via `install.sh` (which writes the `plugins` entry for you);
 the options block is only needed to change defaults.
+
+### Control modes: `subagent` (default) vs `herdr`
+
+By default (`control: "subagent"`) role sessions are plugin child sessions —
+invisible but fully driven by the plugin. With `control: "herdr"` the builder
+and each perspective auditor run as **full OpenCode TUIs in
+[herdr](https://herdr.dev) panes** next to your session, so you can watch them
+work in real time and get herdr's done/blocked chimes. Requirements and
+behavior:
+
+- OpenCode must run inside a herdr pane with the herdr CLI on PATH —
+  otherwise the loop **fails loudly at the start of the build phase** instead
+  of silently falling back.
+- Panes are anchored by **session identity**: the plugin asks `herdr agent
+  list` which pane the origin session's TUI actually runs in. The builder is
+  a `right` split of that pane at `herdr.ratio`; the auditors open a column
+  right of the origin pane, and that column is carved into equal rows by a
+  **balanced down-split tree** (every split ratio is in `[1/3, 0.5]`, so
+  herdr's `[0.1, 0.9]` `--ratio` clamp never distorts a row — `herdr.ratio`
+  sets the column **width** only). The plugin host's `HERDR_PANE_ID` is only a
+  warned fallback — the plugin runs in the opencode server process, whose
+  env pane can be stale or in another workspace. Panes are created before
+  any agent starts and closed after the phase's submission is verified on
+  disk (a failed close is cosmetic).
+- The prompt `--wait` is only a gate: the loop's truth stays the on-disk
+  submission in `.pba/<loopId>/state.json`. A timed-out or blocked pane is
+  read and logged (blocked also announces to your session) and falls into the
+  usual single phase retry.
+- Loop state records each pane's ID, agent name, and the session ID
+  (`herdrPanes` / `sessions` in state.json). The role session is pre-created
+  via the server API with the role's agent and resolved model (same
+  precedence as subagent mode), and the TUI resumes it with
+  `opencode -s <id> --auto` — so role enforcement works from the first
+  prompt and the pane shows the real session.
+- Verified against **herdr 0.9.5**. To sanity-check your installed herdr
+  end-to-end (spawns and closes one throwaway opencode pane):
+
+  ```bash
+  bash scripts/herdr-real-smoke.sh   # run from inside a herdr pane
+  ```
 
 ## Roles
 
@@ -146,8 +193,8 @@ The planner uses the main session's own model by definition.
 | Role | Where it runs | Guardrails |
 |---|---|---|
 | planner (no agent) | your session, prompted in place by the loop | read-only discipline via the planner prompt; files `plan.md` via `pba_plan_submit` |
-| `pba-builder` | spawned subagent session | implements the plan exactly, minimal diff, no commits |
-| `pba-auditor` | spawned subagent session (one per perspective) | edit denied, `git diff/status/log/show` allowed |
+| `pba-builder` | spawned subagent session (or a herdr pane with `control: "herdr"`) | implements the plan exactly, minimal diff, no commits |
+| `pba-auditor` | spawned subagent session, one per perspective (or herdr panes with `control: "herdr"`) | edit denied, `git diff/status/log/show` allowed |
 
 Each role must finish with its mandatory structured submission tool
 (`pba_plan_submit` / `pba_build_complete` / `pba_verdict`). Verdicts are

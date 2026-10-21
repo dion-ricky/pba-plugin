@@ -3,6 +3,7 @@
 // record. The LLM never decides the loop; this module does.
 
 import type { Context as PluginContext } from "@opencode/plugin/promise/plugin"
+import { createHash } from "node:crypto"
 import { promises as fs } from "node:fs"
 import {
   appendEvents,
@@ -23,6 +24,20 @@ import {
   type PbaVerdict,
 } from "./state"
 import { AGENT_BY_ROLE, auditorPrompt, builderPrompt, DEFAULT_PERSPECTIVES, plannerPrompt } from "./prompts"
+import {
+  HERDR_MAX_RATIO,
+  HERDR_MIN_RATIO,
+  HerdrError,
+  herdrAgentPrompt,
+  herdrAgentRead,
+  herdrAgentStart,
+  herdrPaneClose,
+  herdrPaneLayout,
+  herdrPrecheck,
+  herdrSplitPane,
+  planBalancedColumn,
+  resolveOriginPane,
+} from "./herdr"
 
 export interface PbaOptions {
   /** Directory name for coordination state, relative to the repo root. */
@@ -36,6 +51,14 @@ export interface PbaOptions {
   models?: { build?: string; audit?: string }
   /** Perspectives reviewed in parallel during the audit phase. */
   auditPerspectives?: string[]
+  /**
+   * How role sessions are driven: "subagent" (default) spawns plugin child
+   * sessions; "herdr" launches full OpenCode TUIs in herdr panes via the
+   * herdr CLI (requires OpenCode to run inside herdr).
+   */
+  control?: "subagent" | "herdr"
+  /** herdr driver tuning; only used when control is "herdr". */
+  herdr?: { ratio?: number; promptTimeoutMs?: number }
 }
 
 export interface LoopConfig {
@@ -44,6 +67,8 @@ export interface LoopConfig {
   maxAttempts: number
   models: { build?: string; audit?: string }
   auditPerspectives: string[]
+  control: "subagent" | "herdr"
+  herdr: { ratio: number; promptTimeoutMs: number }
 }
 
 export function resolveConfig(rootDir: string, options: PbaOptions | undefined): LoopConfig {
@@ -75,7 +100,46 @@ export function resolveConfig(rootDir: string, options: PbaOptions | undefined):
       `[pba] options.auditPerspectives must be a non-empty array of kebab-case perspective names, got ${JSON.stringify(options?.auditPerspectives)}`,
     )
   }
-  return { rootDir, stateDirName: options?.stateDir ?? ".pba", maxAttempts, models, auditPerspectives }
+  const control = options?.control ?? "subagent"
+  if (control !== "subagent" && control !== "herdr") {
+    throw new Error(`[pba] options.control must be "subagent" or "herdr", got ${JSON.stringify(options?.control)}`)
+  }
+  const rawHerdr = options?.herdr
+  if (
+    rawHerdr !== undefined &&
+    (typeof rawHerdr !== "object" || rawHerdr === null || Array.isArray(rawHerdr))
+  ) {
+    throw new Error(
+      `[pba] options.herdr must be an object with optional ratio and promptTimeoutMs, got ${JSON.stringify(options?.herdr)}`,
+    )
+  }
+  const herdrRatio = rawHerdr?.ratio ?? 0.5
+  if (
+    typeof herdrRatio !== "number" ||
+    !Number.isFinite(herdrRatio) ||
+    herdrRatio < HERDR_MIN_RATIO ||
+    herdrRatio > HERDR_MAX_RATIO
+  ) {
+    throw new Error(
+      `[pba] options.herdr.ratio must be a number in [${HERDR_MIN_RATIO}, ${HERDR_MAX_RATIO}] ` +
+        `(herdr clamps --ratio to that range), got ${JSON.stringify(rawHerdr?.ratio)}`,
+    )
+  }
+  const herdrPromptTimeoutMs = rawHerdr?.promptTimeoutMs ?? 600000
+  if (!Number.isInteger(herdrPromptTimeoutMs) || herdrPromptTimeoutMs < 1) {
+    throw new Error(
+      `[pba] options.herdr.promptTimeoutMs must be a positive integer, got ${JSON.stringify(rawHerdr?.promptTimeoutMs)}`,
+    )
+  }
+  return {
+    rootDir,
+    stateDirName: options?.stateDir ?? ".pba",
+    maxAttempts,
+    models,
+    auditPerspectives,
+    control,
+    herdr: { ratio: herdrRatio, promptTimeoutMs: herdrPromptTimeoutMs },
+  }
 }
 
 export function loopDirFor(config: LoopConfig, loopId: string): string {
@@ -111,24 +175,12 @@ async function spawnPhaseSession(
   state: PbaState,
   role: SpawnRole,
   sessionKey?: PbaRole | `audit:${string}`,
+  paneId?: string,
 ): Promise<string> {
-  // Model resolution order: explicit per-role override > the origin (main)
-  // session's selected model, variant included > OpenCode's config default.
-  let model: { id: string; providerID: string; variant?: string } | undefined
-  const override = config.models[role]
-  if (override) {
-    const slash = override.indexOf("/")
-    model = { providerID: override.slice(0, slash), id: override.slice(slash + 1) }
-  } else {
-    try {
-      const origin = await ctx.session.get({ sessionID: state.originSessionID })
-      if (origin.model) {
-        model = { providerID: origin.model.providerID, id: origin.model.id, variant: origin.model.variant }
-      }
-    } catch (cause) {
-      console.error(`[pba] could not read origin session model: ${(cause as Error).message}`)
-    }
+  if (config.control === "herdr") {
+    return spawnHerdrPhaseSession(ctx, config, state, role, sessionKey, paneId)
   }
+  const model = await resolvePhaseModel(ctx, config, state, role)
 
   const created = await ctx.session.create({
     title: `PBA ${state.loopId} · ${sessionKey ?? role} (attempt ${state.attempt})`,
@@ -144,6 +196,149 @@ async function spawnPhaseSession(
   return sessionID
 }
 
+/**
+ * Model resolution order: explicit per-role override > the origin (main)
+ * session's selected model, variant included > OpenCode's config default.
+ * Shared by the subagent and herdr control paths.
+ */
+async function resolvePhaseModel(
+  ctx: PluginContext,
+  config: LoopConfig,
+  state: PbaState,
+  role: SpawnRole,
+): Promise<{ id: string; providerID: string; variant?: string } | undefined> {
+  const override = config.models[role]
+  if (override) {
+    const slash = override.indexOf("/")
+    return { providerID: override.slice(0, slash), id: override.slice(slash + 1) }
+  }
+  try {
+    const origin = await ctx.session.get({ sessionID: state.originSessionID })
+    if (origin.model) {
+      return { providerID: origin.model.providerID, id: origin.model.id, variant: origin.model.variant }
+    }
+  } catch (cause) {
+    console.error(`[pba] could not read origin session model: ${(cause as Error).message}`)
+  }
+  return undefined
+}
+
+/** herdr agent name for a role key; unique per loop, role, attempt and phase retry. */
+function herdrAgentName(state: PbaState, key: string): string {
+  const retry = state.phaseRetries > 0 ? `r${state.phaseRetries}` : ""
+  const tag = `a${state.attempt}${retry}`
+  // herdr agent names must be 1-32 chars of [a-z0-9-_] starting with a letter
+  // (verified against herdr 0.9.5). The loopId is far too long to embed, so a
+  // hash keeps names unique per loop/role/attempt/retry while the readable
+  // key prefix keeps the panes identifiable in the herdr UI.
+  const hash = createHash("sha256").update(`${state.loopId}|${key}|${tag}`).digest("hex").slice(0, 8)
+  const keySlug = key.replace(/[^a-zA-Z0-9-]/g, "-").toLowerCase().slice(0, 10)
+  return `pba-${keySlug}-${tag}-${hash}`
+}
+
+/**
+ * herdr control path (control:"herdr"): run the role as a full OpenCode TUI
+ * in a herdr pane. The role session is pre-created via the server API with
+ * its agent and model (opencode's TUI has no --agent/--model flags, but
+ * `-s <sessionID>` resumes a session — carrying its agent/model/variant —
+ * and `--auto` approves non-denied permissions; verified against opencode
+ * 2.0.32). Because the session exists before the pane does, role enforcement
+ * (tools.ts maps the calling session through state.sessions) works from the
+ * first prompt. `paneId` is pre-created by the caller (the audit phase
+ * creates all panes before any agent start); when omitted, the pane is split
+ * here, anchored to the origin session's pane.
+ */
+async function spawnHerdrPhaseSession(
+  ctx: PluginContext,
+  config: LoopConfig,
+  state: PbaState,
+  role: SpawnRole,
+  sessionKey?: PbaRole | `audit:${string}`,
+  paneId?: string,
+): Promise<string> {
+  const key = sessionKey ?? role
+  const loopDir = loopDirFor(config, state.loopId)
+  let pane = paneId
+  if (!pane) {
+    await herdrPrecheck()
+    // Anchor the split to the pane the origin session's TUI actually runs in
+    // (resolved by session identity, not the plugin host's env — the host's
+    // HERDR_PANE_ID can be stale or point at another workspace). Builder: one
+    // right split at the configured ratio; auditors (defensive path): down.
+    const anchorPane = await resolveOriginPane(state.originSessionID)
+    pane = role === "build"
+      ? await herdrSplitPane({ sourcePaneId: anchorPane, direction: "right", ratio: config.herdr.ratio, noFocus: true })
+      : await herdrSplitPane({ sourcePaneId: anchorPane, direction: "down", noFocus: true })
+  }
+  const paneID = pane
+  const agentName = herdrAgentName(state, key)
+  const model = await resolvePhaseModel(ctx, config, state, role)
+  // Same creation call as the subagent path — except parentID: resuming a
+  // child session makes the TUI open on its Subagents tab instead of the
+  // composer (verified live), so herdr sessions are created top-level.
+  const created = await ctx.session.create({
+    title: `PBA ${state.loopId} · ${key} (attempt ${state.attempt})`,
+    agent: AGENT_BY_ROLE[role],
+    location: { directory: config.rootDir },
+    ...(model ? { model } : {}),
+  })
+  await herdrAgentStart(agentName, paneID, ["-s", created.id, "--auto"])
+  await updateState(loopDir, (draft) => {
+    draft.sessions[key] = created.id
+    draft.herdrPanes = {
+      ...draft.herdrPanes,
+      [key]: { paneId: paneID, agent: agentName, nativeSessionID: created.id },
+    }
+  })
+  return created.id
+}
+
+/**
+ * herdr prompt/wait: deliver the phase prompt to the role's pane and wait for
+ * the turn to settle. The wait outcome is a gate only — the on-disk
+ * submission check stays authoritative. On `blocked` the origin session is
+ * announced and we stop waiting for that pane; on `timeout`/`stalled` the
+ * pane is read first so a prompt is never re-sent while one may be pending.
+ * Returns the outcome string for the phase events/error message.
+ */
+async function herdrPromptAndWait(
+  ctx: PluginContext,
+  config: LoopConfig,
+  state: PbaState,
+  key: PbaRole | `audit:${string}`,
+  promptText: string,
+): Promise<string> {
+  const agentName = herdrAgentName(state, key)
+  const outcome = await herdrAgentPrompt(agentName, promptText, { timeoutMs: config.herdr.promptTimeoutMs })
+  if (outcome === "done") return "succeeded"
+  // Read the pane before any retry so a pending prompt is never duplicated;
+  // a failed read is only diagnostics and must not mask the real outcome.
+  const paneText = await herdrAgentRead(agentName).catch(
+    (cause) => `(agent read failed: ${(cause as Error).message})`,
+  )
+  console.error(`[pba] herdr agent "${agentName}" reported ${outcome} without submitting; pane contents: ${paneText}`)
+  if (outcome === "blocked") {
+    await announce(
+      ctx,
+      state.originSessionID,
+      `⏸️ **PBA \`${state.loopId}\`** — herdr agent \`${agentName}\` is blocked (permission/question UI in its pane); the loop stopped waiting and will verify the ${key} submission on disk.`,
+    )
+  }
+  return outcome
+}
+
+/** Close a role's herdr pane after its disk submission check passed. Cosmetic: a failed close never fails the loop. */
+async function closeHerdrPane(config: LoopConfig, loopDir: string, key: string): Promise<void> {
+  try {
+    const fresh = await readState(loopDir)
+    const paneId = fresh.herdrPanes?.[key]?.paneId
+    if (!paneId) return
+    await herdrPaneClose(paneId)
+  } catch (cause) {
+    console.error(`[pba] herdr pane close for "${key}" failed (cosmetic; the loop continues): ${(cause as Error).message}`)
+  }
+}
+
 async function runPhase(
   ctx: PluginContext,
   config: LoopConfig,
@@ -154,10 +349,15 @@ async function runPhase(
   const loopDir = loopDirFor(config, state.loopId)
   const sessionID = await spawnPhaseSession(ctx, config, state, role)
   await appendEvents(loopDir, [{ event: "phase.start", phase: role, attempt: state.attempt, sessionID }])
-  await ctx.session.prompt({ sessionID, text: promptText })
-  await ctx.session.wait({ sessionID })
-  const info = await ctx.session.get({ sessionID })
-  const outcome = info.outcome
+  let outcome: string | undefined
+  if (config.control === "herdr") {
+    outcome = await herdrPromptAndWait(ctx, config, state, role, promptText)
+  } else {
+    await ctx.session.prompt({ sessionID, text: promptText })
+    await ctx.session.wait({ sessionID })
+    const info = await ctx.session.get({ sessionID })
+    outcome = info.outcome
+  }
   const fresh = await readState(loopDir)
   if (fresh.submission?.kind !== EXPECTED_SUBMISSION[role]) {
     await appendEvents(loopDir, [{ event: "phase.incomplete", phase: role, attempt: state.attempt, outcome }])
@@ -166,6 +366,7 @@ async function runPhase(
     )
   }
   await appendEvents(loopDir, [{ event: "phase.submitted", phase: role, attempt: state.attempt }])
+  if (config.control === "herdr") await closeHerdrPane(config, loopDir, role)
 }
 
 /**
@@ -205,16 +406,24 @@ async function runPerspectiveAudit(
   config: LoopConfig,
   state: PbaState,
   perspective: string,
+  paneId?: string,
 ): Promise<void> {
   const loopDir = loopDirFor(config, state.loopId)
-  const sessionID = await spawnPhaseSession(ctx, config, state, "audit", `audit:${perspective}`)
+  const sessionKey = `audit:${perspective}` as const
+  const promptText = auditorPrompt(state, loopDir, perspective)
+  const sessionID = await spawnPhaseSession(ctx, config, state, "audit", sessionKey, paneId)
   await appendEvents(loopDir, [
     { event: "phase.start", phase: "audit", perspective, attempt: state.attempt, sessionID },
   ])
-  await ctx.session.prompt({ sessionID, text: auditorPrompt(state, loopDir, perspective) })
-  await ctx.session.wait({ sessionID })
-  const info = await ctx.session.get({ sessionID })
-  const outcome = info.outcome
+  let outcome: string | undefined
+  if (config.control === "herdr") {
+    outcome = await herdrPromptAndWait(ctx, config, state, sessionKey, promptText)
+  } else {
+    await ctx.session.prompt({ sessionID, text: promptText })
+    await ctx.session.wait({ sessionID })
+    const info = await ctx.session.get({ sessionID })
+    outcome = info.outcome
+  }
   const fresh = await readState(loopDir)
   const filed = fresh.perspectiveVerdicts?.some(
     (v) => v.perspective === perspective && v.attempt === state.attempt,
@@ -228,6 +437,7 @@ async function runPerspectiveAudit(
   await appendEvents(loopDir, [
     { event: "phase.submitted", phase: "audit", perspective, attempt: state.attempt },
   ])
+  if (config.control === "herdr") await closeHerdrPane(config, loopDir, sessionKey)
 }
 
 function perspectiveRecord(
@@ -263,6 +473,55 @@ function mergePerspectiveVerdicts(
 }
 
 /**
+ * Build the audit column: one right split of the anchor pane (the column),
+ * then the balanced down-split tree from planBalancedColumn. Returns the leaf
+ * pane ids top-to-bottom, one per auditor. Every split ratio is in
+ * [1/3, 0.5], so herdr's [0.1, 0.9] `--ratio` clamp never distorts a row and
+ * each leaf gets 1/n of the column (within 1-row rounding).
+ */
+async function arrangeAuditColumn(anchorPane: string, n: number, ratio: number): Promise<string[]> {
+  const plan = planBalancedColumn(n)
+  const columnPane = await herdrSplitPane({ sourcePaneId: anchorPane, direction: "right", ratio, noFocus: true })
+  const bySlot = new Map<number, string>([[0, columnPane]])
+  for (const step of plan.steps) {
+    const source = bySlot.get(step.source)
+    if (!source) throw new HerdrError(`audit column plan references an unknown slot ${step.source}`)
+    const created = await herdrSplitPane({ sourcePaneId: source, direction: "down", ratio: step.ratio, noFocus: true })
+    bySlot.set(step.creates, created)
+  }
+  return plan.leaves.map((slot) => {
+    const paneId = bySlot.get(slot)
+    if (!paneId) throw new HerdrError(`audit column plan produced no pane for leaf slot ${slot}`)
+    return paneId
+  })
+}
+
+/**
+ * Best-effort layout check after the audit column is built: read the tab
+ * layout, compare the leaf pane heights, and append a `layout.unequal` event
+ * when the spread exceeds herdr's 1-row rounding. Never fatal — a read or
+ * parse failure here is cosmetic and must not fail the loop.
+ */
+async function verifyColumnEqual(loopDir: string, paneIds: string[]): Promise<void> {
+  if (paneIds.length < 2) return
+  try {
+    const layout = await herdrPaneLayout({ paneId: paneIds[0] })
+    const wanted = new Set(paneIds)
+    const heights = layout.panes
+      .filter((p) => p.paneId !== undefined && wanted.has(p.paneId) && p.height !== undefined)
+      .map((p) => p.height as number)
+    if (heights.length < paneIds.length) return
+    const spread = Math.max(...heights) - Math.min(...heights)
+    if (spread > 1) {
+      await appendEvents(loopDir, [{ event: "layout.unequal", spread, heights }])
+      console.error(`[pba] audit column panes are unequal (spread ${spread} rows): ${JSON.stringify(heights)}`)
+    }
+  } catch (cause) {
+    console.error(`[pba] audit column layout check failed (cosmetic; the loop continues): ${(cause as Error).message}`)
+  }
+}
+
+/**
  * Audit phase: spawn one auditor session per missing perspective in parallel,
  * then deterministically merge the perspective verdicts into review.md and a
  * single VerdictRecord. Idempotent: only missing perspectives are spawned and
@@ -277,7 +536,24 @@ async function runAuditPhase(ctx: PluginContext, config: LoopConfig, state: PbaS
       state.originSessionID,
       `🔎 **PBA \`${state.loopId}\`** — audit: ${missing.length} perspective auditor(s) starting (${missing.join(", ")}).`,
     )
-    await Promise.all(missing.map((perspective) => runPerspectiveAudit(ctx, config, state, perspective)))
+    let panes: string[] | undefined
+    if (config.control === "herdr") {
+      // All audit panes are created before any agent start. Layout: the
+      // first auditor opens a column right of the origin pane (the only
+      // pane guaranteed alive — the builder pane was closed after its
+      // submission check, and closed herdr panes are gone); the column is
+      // then carved into equal rows by a balanced down-split tree (every
+      // ratio in [1/3, 0.5], so herdr's [0.1, 0.9] clamp never distorts a
+      // row). A layout read-back warns when a row is off by more than the
+      // unavoidable 1-row rounding.
+      await herdrPrecheck()
+      const anchorPane = await resolveOriginPane(state.originSessionID)
+      panes = await arrangeAuditColumn(anchorPane, missing.length, config.herdr.ratio)
+      await verifyColumnEqual(loopDir, panes)
+    }
+    await Promise.all(
+      missing.map((perspective, i) => runPerspectiveAudit(ctx, config, state, perspective, panes?.[i])),
+    )
   }
   const fresh = await readState(loopDir)
   if (config.auditPerspectives.some((p) => !perspectiveRecord(config, fresh, p))) {

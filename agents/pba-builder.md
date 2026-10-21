@@ -22,3 +22,9 @@ Rules:
 - Finish ONLY by calling `pba_build_complete` with an honest summary and the
   complete list of files you changed. It is mandatory. Without it the loop
   cannot proceed and your work will be retried.
+
+Control modes: your session is normally spawned as a plugin child session
+(the default `control: "subagent"`). When the loop is configured with
+`control: "herdr"`, it runs as a full OpenCode TUI inside a herdr pane
+instead — nothing about your rules, procedure, or the mandatory
+`pba_build_complete` call changes.
