@@ -2,16 +2,23 @@
 # install.sh — install the PBA plugin into a target project (project-local only).
 #
 # Usage:
-#   bash install.sh [target-dir] [--copy]
+#   bash install.sh [target-dir] [--copy] [--control subagent|herdr] [--yes]
 #
-#   target-dir   project to install into (default: current directory)
-#   --copy       copy the plugin folder into <target>/.opencode/plugins/pba
-#                instead of referencing it by absolute path
+#   target-dir      project to install into (default: current directory)
+#   --copy          copy the plugin folder into <target>/.opencode/plugins/pba
+#                   instead of referencing it by absolute path
+#   --control MODE  skip the prompt and set the loop control mode:
+#                   "subagent" (default; roles run as plugin child sessions) or
+#                   "herdr" (roles run as full OpenCode TUIs in herdr panes)
+#   --yes, -y       do not prompt; keep the existing control mode (or default
+#                   to "subagent" on a fresh config)
 #
 # What it does:
 #   1. Reads the pba-* agent definitions from ./agents/*.md (single source of
 #      truth) and converts them to `agents` config entries.
-#   2. Adds the plugin to the target's `plugins` config.
+#   2. Asks which control mode to use (unless --control, --yes, or a
+#      non-interactive stdin), then adds the plugin with the matching `options`
+#      to the target's `plugins` config.
 #   3. Writes/merges opencode.json(c) in the target — existing config is backed
 #      up before any modification; if it cannot be parsed, the exact snippet to
 #      merge manually is printed instead.
@@ -21,20 +28,38 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # Print this script's leading comment block (after the shebang) verbatim.
+  awk 'NR > 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
 
 COPY_MODE=0
+YES=0
+CONTROL_MODE=""
 TARGET=""
-for arg in "$@"; do
-  case "$arg" in
-    --copy) COPY_MODE=1 ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --copy) COPY_MODE=1; shift ;;
+    --control)
+      CONTROL_MODE="${2:-}"
+      if [[ -z "$CONTROL_MODE" ]]; then
+        echo "error: --control needs a value (subagent|herdr)" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --control=*) CONTROL_MODE="${1#--control=}"; shift ;;
+    -y|--yes) YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
-    -*) echo "Unknown option: $arg" >&2; usage; exit 1 ;;
-    *) TARGET="$arg" ;;
+    -*) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    *) TARGET="$1"; shift ;;
   esac
 done
 TARGET="${TARGET:-$PWD}"
+
+if [[ -n "$CONTROL_MODE" && "$CONTROL_MODE" != "subagent" && "$CONTROL_MODE" != "herdr" ]]; then
+  echo "error: --control must be 'subagent' or 'herdr' (got '${CONTROL_MODE}')" >&2
+  exit 1
+fi
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENTS_DIR="${PLUGIN_DIR}/agents"
 
@@ -53,7 +78,29 @@ fi
 
 TARGET_ABS="$(cd "$TARGET" && pwd)"
 
-TARGET="$TARGET_ABS" PLUGIN_DIR="$PLUGIN_DIR" AGENTS_DIR="$AGENTS_DIR" COPY_MODE=$COPY_MODE node <<'NODE_EOF'
+# Ask which control mode the loop should use. Skipped when --control was given,
+# when --yes was passed, or when stdin is not interactive (piped/CI); in those
+# cases the Node step keeps the target's existing mode (default: subagent).
+if [[ -z "$CONTROL_MODE" && $YES -eq 0 && -t 0 && -t 1 ]]; then
+  echo
+  echo "PBA loop control mode:"
+  echo "  1) subagent  roles run as invisible plugin child sessions (default)"
+  echo "  2) herdr     builder/auditors run as full OpenCode TUIs in herdr panes"
+  while :; do
+    printf 'Choose [1/2] (Enter keeps the current setting): '
+    read -r answer || answer=""
+    answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
+    case "$answer" in
+      "") CONTROL_MODE="keep"; break ;;
+      1|s|subagent) CONTROL_MODE="subagent"; break ;;
+      2|h|herdr) CONTROL_MODE="herdr"; break ;;
+      *) echo "Please enter 1 or 2." ;;
+    esac
+  done
+  echo
+fi
+
+TARGET="$TARGET_ABS" PLUGIN_DIR="$PLUGIN_DIR" AGENTS_DIR="$AGENTS_DIR" COPY_MODE=$COPY_MODE CONTROL_MODE="$CONTROL_MODE" node <<'NODE_EOF'
 const fs = require("node:fs")
 const path = require("node:path")
 
@@ -63,6 +110,43 @@ const AGENTS_DIR = process.env.AGENTS_DIR
 const COPY_MODE = process.env.COPY_MODE === "1"
 
 const ROLE_IDS = ["pba-builder", "pba-auditor"]
+
+// --- control mode ------------------------------------------------------------
+
+// "keep" (or unset) preserves the target's existing mode and falls back to the
+// plugin default. The bash prompt passes "keep" when the user just hits Enter.
+const RAW_CONTROL = process.env.CONTROL_MODE || "keep"
+if (!["keep", "subagent", "herdr"].includes(RAW_CONTROL)) {
+  console.error(`error: invalid control mode "${RAW_CONTROL}" (expected subagent or herdr)`)
+  process.exit(1)
+}
+
+/** Build the plugin `options` block for a control mode, preserving other keys. */
+function optionsFor(mode, prev) {
+  const options = { ...(prev && typeof prev === "object" ? prev : {}), control: mode }
+  if (mode === "herdr") {
+    options.herdr =
+      options.herdr && typeof options.herdr === "object"
+        ? options.herdr
+        : { ratio: 0.5, promptTimeoutMs: 600000 }
+  } else {
+    delete options.herdr
+  }
+  return options
+}
+
+/** The plugin entry matching a package ref, or undefined. */
+function findPluginEntry(list, packageRef) {
+  return list.find((p) => (typeof p === "string" ? p : p && p.package) === packageRef)
+}
+
+/** The control mode already configured for a package ref, if any. */
+function existingControl(config, packageRef) {
+  if (!Array.isArray(config.plugins)) return undefined
+  const entry = findPluginEntry(config.plugins, packageRef)
+  const mode = entry && typeof entry === "object" ? entry.options && entry.options.control : undefined
+  return mode === "herdr" || mode === "subagent" ? mode : undefined
+}
 
 // --- JSONC handling ---------------------------------------------------------
 
@@ -186,7 +270,22 @@ for (const rel of candidates) {
     } catch (cause) {
       console.error(`error: ${rel} could not be parsed as JSONC (${cause.message}).`)
       console.error("Merge this manually:\n")
-      console.error(JSON.stringify({ plugins: [{ package: COPY_MODE ? path.join(TARGET, ".opencode/plugins/pba") : PLUGIN_DIR }], agents }, null, 2))
+      const snippetControl = RAW_CONTROL === "keep" ? "subagent" : RAW_CONTROL
+      console.error(
+        JSON.stringify(
+          {
+            plugins: [
+              {
+                package: COPY_MODE ? path.join(TARGET, ".opencode/plugins/pba") : PLUGIN_DIR,
+                options: optionsFor(snippetControl, undefined),
+              },
+            ],
+            agents,
+          },
+          null,
+          2,
+        ),
+      )
       process.exit(1)
     }
     break
@@ -210,9 +309,18 @@ if (COPY_MODE) {
 
 // --- merge -------------------------------------------------------------------
 
+const control = RAW_CONTROL === "keep" ? existingControl(config, packageRef) ?? "subagent" : RAW_CONTROL
+
 if (!Array.isArray(config.plugins)) config.plugins = []
-const already = config.plugins.some((p) => (typeof p === "string" ? p : p && p.package) === packageRef)
-if (!already) config.plugins.push({ package: packageRef })
+const existing = findPluginEntry(config.plugins, packageRef)
+if (existing === undefined) {
+  config.plugins.push({ package: packageRef, options: optionsFor(control, undefined) })
+} else if (typeof existing === "string") {
+  config.plugins[config.plugins.indexOf(existing)] = { package: packageRef, options: optionsFor(control, undefined) }
+} else {
+  existing.package = packageRef
+  existing.options = optionsFor(control, existing.options)
+}
 
 config.agents = config.agents && typeof config.agents === "object" ? config.agents : {}
 for (const [id, def] of Object.entries(agents)) {
@@ -232,6 +340,12 @@ fs.writeFileSync(configFile, JSON.stringify(config, null, 2) + "\n", "utf8")
 console.log(`\ninstalled PBA plugin into ${configFile}`)
 console.log(`  plugin: ${packageRef}${COPY_MODE ? " (copied)" : " (referenced by path)"}`)
 console.log(`  agents: ${ROLE_IDS.join(", ")}`)
+console.log(
+  `  control: ${control}${control === "herdr" ? " (roles run as TUIs in herdr panes)" : " (roles run as plugin child sessions)"}`,
+)
+if (control === "herdr") {
+  console.log(`    herdr mode requires the herdr CLI on PATH and OpenCode running inside a herdr pane.`)
+}
 console.log(`\nNext steps:`)
 console.log(`  1. Open an OpenCode session in ${TARGET}`)
 console.log(`  2. Run:  /pba <spec>   (or just ask for "the PBA loop")`)

@@ -80,6 +80,10 @@ bash /path/to/pba-plugin/install.sh /path/to/project
 
 # or vendor a copy into the project itself
 bash /path/to/pba-plugin/install.sh /path/to/project --copy
+
+# skip the control-mode prompt (for scripts/CI)
+bash /path/to/pba-plugin/install.sh /path/to/project --control herdr
+bash /path/to/pba-plugin/install.sh /path/to/project --control subagent --yes
 ```
 
 The script reads the two `pba-*.md` agent definitions (single source of
@@ -87,6 +91,15 @@ truth), converts them to `agents` config entries, adds the plugin to `plugins`,
 and writes or merges the target's `opencode.json(c)` — existing config is
 backed up first, and an unparseable config aborts with a manual-merge snippet.
 Re-running is safe (idempotent, no duplicate entries).
+
+Before writing, the installer asks which **control mode** to use and writes the
+matching `options.control` (see [Control modes](#control-modes-subagent-default-vs-herdr)):
+`subagent` (plugin child sessions, the default) or `herdr` (role sessions as
+full TUIs in herdr panes). Pass `--control subagent|herdr` to skip the prompt,
+or `--yes` to keep the current setting. With no TTY (piped install) the prompt
+is skipped and the existing mode is kept. Any other `options` you set
+(`stateDir`, `maxAttempts`, `auditPerspectives`, `models`) are preserved, and
+switching modes does not disturb them.
 
 The equivalent config, if you prefer doing it by hand:
 
