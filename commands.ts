@@ -11,11 +11,30 @@ import { loopDirOf, readState } from "./state"
 import { plannerPrompt } from "./prompts"
 import type { SessionLoopMap } from "./tools"
 
+/**
+ * Post a command reply (`/pba-status`, usage, errors) to a session WITHOUT
+ * waking it: `session.synthetic` starts a turn unless `resume: false`, and a
+ * status reply must not make the session's agent act again.
+ */
 async function notify(ctx: PluginContext, sessionID: string, text: string): Promise<void> {
   try {
-    await ctx.session.synthetic({ sessionID, text })
+    await ctx.session.synthetic({ sessionID, text, resume: false })
   } catch (cause) {
     console.error(`[pba] could not notify session ${sessionID}: ${(cause as Error).message}`)
+  }
+}
+
+/**
+ * The single deliberately turn-starting message: the planner hand-off fallback.
+ * `resume: true` must start a turn because the origin (main) session IS the
+ * planner — it is used only when `session.prompt` could not deliver the
+ * hand-off. Never use it for progress/status text.
+ */
+async function handOff(ctx: PluginContext, sessionID: string, text: string): Promise<void> {
+  try {
+    await ctx.session.synthetic({ sessionID, text, resume: true })
+  } catch (cause) {
+    console.error(`[pba] could not hand off to session ${sessionID}: ${(cause as Error).message}`)
   }
 }
 
@@ -54,7 +73,7 @@ export async function registerCommands(
             await ctx.session.prompt({ sessionID, text: handoff })
           } catch (cause) {
             console.error(`[pba] could not prompt session ${sessionID} with the planner hand-off: ${(cause as Error).message}`)
-            await notify(
+            await handOff(
               ctx,
               sessionID,
               `🔁 **PBA loop \`${loopId}\` started** — you are the PLANNER: call \`pba_state_read\`, investigate the codebase read-only, then submit the plan with \`pba_plan_submit\`. Planning happens in this session; no planner subagent is spawned.\nCheck with \`/pba-status\`.`,

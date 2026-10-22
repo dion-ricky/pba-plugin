@@ -586,9 +586,15 @@ async function runAuditPhase(ctx: PluginContext, config: LoopConfig, state: PbaS
   ])
 }
 
+/**
+ * Post a progress message to a session WITHOUT waking it. `resume: false` is
+ * required: `session.synthetic` otherwise starts a turn in the target session,
+ * so every progress message would wake the origin session and make its agent
+ * act again while the loop is already running its own phases.
+ */
 async function announce(ctx: PluginContext, sessionID: string, text: string): Promise<void> {
   try {
-    await ctx.session.synthetic({ sessionID, text })
+    await ctx.session.synthetic({ sessionID, text, resume: false })
   } catch (cause) {
     // Origin session may be gone (user closed it); the loop continues on disk.
     console.error(`[pba] could not notify origin session ${sessionID}: ${(cause as Error).message}`)

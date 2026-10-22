@@ -42,7 +42,10 @@ pba-plugin/
 
 Natural language works too: ask your primary agent to "run the PBA loop for
 …" — the `pba-loop` skill teaches it to call the `pba_start` tool. Progress
-and the final verdict are posted to your session as messages.
+and the final verdict are posted to your session as messages. These messages
+are **non-resuming**: they never start a turn, so a running loop never makes
+your agent act again. The single exception is the planner hand-off, which
+deliberately starts a turn (your session is the planner).
 
 **Planning happens in your session**: after `pba_start` (or `/pba`), the
 calling session itself is the planner — it investigates the codebase
@@ -242,6 +245,10 @@ sessions.
   starts; `/pba-resume` continues from the incomplete phase.
 - **Interruption**: if a phase session is interrupted, the loop pauses with
   the reason rather than advancing on missing work.
+- **Notifications never wake your session**: progress messages, `/pba-status`
+  replies and error notices are posted with `resume: false`, so only the loop's
+  own phase sessions run work. The planner hand-off is the only message that
+  deliberately starts a turn.
 - **Parallel loops**: unique loop IDs and per-loop directories; the driver
   refuses to double-drive an already-running loop.
 

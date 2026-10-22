@@ -38,6 +38,13 @@ function check(name: string, condition: boolean, detail = "") {
   }
 }
 
+/**
+ * Every `session.synthetic` input recorded by every mock context in this run.
+ * The loop's progress notifications must never wake a session (`resume: false`);
+ * asserted once, after all scenarios, so no scenario can regress it.
+ */
+const allSyntheticInputs: Array<{ text: string; resume?: boolean }> = []
+
 const AGENT_TO_ROLE: Record<string, string> = {
   "pba-builder": "build",
   "pba-auditor": "audit",
@@ -104,8 +111,9 @@ function makeMockCtx(script: MockScript) {
         }
         return { outcome: "succeeded" }
       },
-      synthetic: async (input: { text: string }) => {
+      synthetic: async (input: { text: string; resume?: boolean }) => {
         synthetics.push(input.text)
+        allSyntheticInputs.push(input)
       },
     },
     tool: {
@@ -1505,6 +1513,13 @@ await scenario("herdr-anchor-pane-resolution", async (root) => {
     else process.env.HERDR_PANE_ID = prevEnv
   }
 })
+
+const waking = allSyntheticInputs.filter((i) => i.resume !== false)
+check(
+  "no loop notification wakes a session (every synthetic call passes resume: false)",
+  allSyntheticInputs.length > 0 && waking.length === 0,
+  `${waking.length} waking notification(s), first: ${JSON.stringify(waking.slice(0, 3))}`,
+)
 
 if (failures > 0) {
   console.error(`\n${failures} FAILURE(S)`)
