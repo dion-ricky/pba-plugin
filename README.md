@@ -42,10 +42,12 @@ pba-plugin/
 
 Natural language works too: ask your primary agent to "run the PBA loop for
 …" — the `pba-loop` skill teaches it to call the `pba_start` tool. Progress
-and the final verdict are posted to your session as messages. These messages
-are **non-resuming**: they never start a turn, so a running loop never makes
-your agent act again. The single exception is the planner hand-off, which
-deliberately starts a turn (your session is the planner).
+and the final verdict are posted to your session as messages. Progress
+messages are **non-resuming**: they never start a turn, so a running loop
+never makes your agent act again. Two exceptions deliberately start a turn —
+the planner hand-off (your session is the planner) and the single terminal
+wake when the loop completes, escalates or fails, so you get the final
+summary without polling.
 
 **Planning happens in your session**: after `pba_start` (or `/pba`), the
 calling session itself is the planner — it investigates the codebase
@@ -245,10 +247,15 @@ sessions.
   starts; `/pba-resume` continues from the incomplete phase.
 - **Interruption**: if a phase session is interrupted, the loop pauses with
   the reason rather than advancing on missing work.
-- **Notifications never wake your session**: progress messages, `/pba-status`
-  replies and error notices are posted with `resume: false`, so only the loop's
-  own phase sessions run work. The planner hand-off is the only message that
-  deliberately starts a turn.
+- **Terminal-only wake**: progress messages (plan ready, build finished, audit
+  starting, revision, retry, paused) and `/pba-status` replies are posted with
+  `resume: false`, so the loop never makes your session's agent act mid-run.
+  When the loop reaches a terminal outcome — **completed**, **escalated** or
+  **failed** — it wakes the origin session exactly once (`resume: true`,
+  `delivery: "queue"`) so you get the final summary and the TUI's done signal
+  without polling. The woken turn is instructed to report and stop: no new
+  loop, no edits, no commit. Paused loops stay silent, because you caused the
+  interruption and are already in the session.
 - **Parallel loops**: unique loop IDs and per-loop directories; the driver
   refuses to double-drive an already-running loop.
 

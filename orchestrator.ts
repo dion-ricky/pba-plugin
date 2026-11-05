@@ -601,6 +601,24 @@ async function announce(ctx: PluginContext, sessionID: string, text: string): Pr
   }
 }
 
+/**
+ * Post a TERMINAL outcome and wake the session ONCE, so the user gets the
+ * loop's final summary (and the TUI's normal idle/done signal) instead of
+ * having to poll `/pba-status`. Used only for completed/escalated/failed —
+ * never for progress. `delivery: "queue"` matters: if the user already started
+ * a turn in the origin session, the wake waits for that turn's boundary
+ * instead of steering into it. The text must tell the woken agent to report
+ * and stop; it must not invite further work (no "commit", no "fix it").
+ */
+async function announceTerminal(ctx: PluginContext, sessionID: string, text: string): Promise<void> {
+  try {
+    await ctx.session.synthetic({ sessionID, text, resume: true, delivery: "queue" })
+  } catch (cause) {
+    // Origin session may be gone (user closed it); the loop continues on disk.
+    console.error(`[pba] could not wake origin session ${sessionID}: ${(cause as Error).message}`)
+  }
+}
+
 function deriveTitle(spec: string): string {
   return spec.trim().split(/\s+/).slice(0, 8).join(" ") || "pba loop"
 }
@@ -800,10 +818,10 @@ async function runLoopTurns(ctx: PluginContext, config: LoopConfig, loopId: stri
         })
         await appendEvents(loopDir, [{ event: "loop.completed", attempt: s.attempt }])
         await rebuildIndex(config.rootDir, config.stateDirName)
-        await announce(
+        await announceTerminal(
           ctx,
           s.originSessionID,
-          `✅ **PBA \`${loopId}\` completed** on attempt ${s.attempt}/${s.maxAttempts}.\nPlan: ${loopDir}/plan.md\nAudit report: ${loopDir}/review.md\n${s.buildSummary ? `Build summary: ${s.buildSummary}\n` : ""}Review the diff and commit when satisfied.`,
+          `✅ **PBA \`${loopId}\` completed** on attempt ${s.attempt}/${s.maxAttempts}.\nPlan: ${loopDir}/plan.md\nAudit report: ${loopDir}/review.md\n${s.buildSummary ? `Build summary: ${s.buildSummary}\n` : ""}Report this result to the user in one short paragraph: status, attempt count, and the artifact paths. Tell them the diff is uncommitted and ready to review and commit. Then stop — do not start another loop, do not edit files, do not commit.`,
         )
         return
       }
@@ -817,10 +835,10 @@ async function runLoopTurns(ctx: PluginContext, config: LoopConfig, loopId: stri
         })
         await appendEvents(loopDir, [{ event: "loop.escalated", attempts: s.attempt }])
         await rebuildIndex(config.rootDir, config.stateDirName)
-        await announce(
+        await announceTerminal(
           ctx,
           s.originSessionID,
-          `🚨 **PBA \`${loopId}\` escalated** — the auditor disapproved ${s.attempt} time(s) and the attempt budget (${s.maxAttempts}) is exhausted.\nLatest findings are in ${loopDir}/review.md.\nDecide yourself, adjust the spec and run \`/pba\` again, or raise \`maxAttempts\` and run \`/pba-resume ${loopId}\`.`,
+          `🚨 **PBA \`${loopId}\` escalated** — the auditor disapproved ${s.attempt} time(s) and the attempt budget (${s.maxAttempts}) is exhausted.\nLatest findings are in ${loopDir}/review.md.\nReport this to the user in one short paragraph and list the options: adjust the spec and run \`/pba\` again, or raise \`maxAttempts\` and run \`/pba-resume ${loopId}\`. Then stop — do not edit files, do not start another loop.`,
         )
         return
       }
@@ -868,11 +886,21 @@ async function failLoop(
     })
     await appendEvents(loopDir, [{ event: interrupted ? "loop.paused" : "loop.failed", error: message }])
     await rebuildIndex(config.rootDir, config.stateDirName)
-    await announce(
-      ctx,
-      state.originSessionID,
-      `${interrupted ? "⏸️" : "❌"} **PBA \`${loopId}\` ${interrupted ? "paused" : "failed"}**: ${message}\n${interrupted ? `Resume with \`/pba-resume ${loopId}\`.` : `Details: ${formatState(state)}`}`,
-    )
+    if (interrupted) {
+      // The user (or their interrupt) caused the pause; they are already in
+      // the session, so this stays a silent progress notice.
+      await announce(
+        ctx,
+        state.originSessionID,
+        `⏸️ **PBA \`${loopId}\` paused**: ${message}\nResume with \`/pba-resume ${loopId}\`.`,
+      )
+    } else {
+      await announceTerminal(
+        ctx,
+        state.originSessionID,
+        `❌ **PBA \`${loopId}\` failed**: ${message}\nDetails: ${formatState(state)}\nReport this failure to the user in one short paragraph: what failed, the last phase, and the resume path. Then stop — do not edit files, do not start another loop.`,
+      )
+    }
   } catch (reporting) {
     // State itself is unreadable/corrupt: log loudly, nothing else we can do.
     console.error(`[pba] loop ${loopId} failed: ${message}; error reporting also failed: ${(reporting as Error).message}`)

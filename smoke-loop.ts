@@ -40,10 +40,11 @@ function check(name: string, condition: boolean, detail = "") {
 
 /**
  * Every `session.synthetic` input recorded by every mock context in this run.
- * The loop's progress notifications must never wake a session (`resume: false`);
- * asserted once, after all scenarios, so no scenario can regress it.
+ * Progress notifications must never wake a session (`resume: false`); only the
+ * terminal outcomes (completed/escalated/failed) wake it once. Asserted once,
+ * after all scenarios, so no scenario can regress it.
  */
-const allSyntheticInputs: Array<{ text: string; resume?: boolean }> = []
+const allSyntheticInputs: Array<{ text: string; resume?: boolean; delivery?: string }> = []
 
 const AGENT_TO_ROLE: Record<string, string> = {
   "pba-builder": "build",
@@ -111,7 +112,7 @@ function makeMockCtx(script: MockScript) {
         }
         return { outcome: "succeeded" }
       },
-      synthetic: async (input: { text: string; resume?: boolean }) => {
+      synthetic: async (input: { text: string; resume?: boolean; delivery?: string }) => {
         synthetics.push(input.text)
         allSyntheticInputs.push(input)
       },
@@ -1514,11 +1515,29 @@ await scenario("herdr-anchor-pane-resolution", async (root) => {
   }
 })
 
+// Terminal-only wake: the loop wakes the origin session exactly for the
+// outcomes a user must see (completed / escalated / failed) and never for
+// progress, which must stay silent.
+const TERMINAL_MARKER = /\*\*PBA `[^`]+` (completed|escalated|failed)\*\*/
 const waking = allSyntheticInputs.filter((i) => i.resume !== false)
+const silent = allSyntheticInputs.filter((i) => i.resume === false)
+const nonTerminalWakes = waking.filter((i) => !TERMINAL_MARKER.test(i.text))
 check(
-  "no loop notification wakes a session (every synthetic call passes resume: false)",
-  allSyntheticInputs.length > 0 && waking.length === 0,
-  `${waking.length} waking notification(s), first: ${JSON.stringify(waking.slice(0, 3))}`,
+  "only terminal outcomes wake a session (completed/escalated/failed)",
+  waking.length > 0 && nonTerminalWakes.length === 0,
+  `${nonTerminalWakes.length} non-terminal wake(s), first: ${JSON.stringify(nonTerminalWakes.slice(0, 3))}`,
+)
+const unqueuedWakes = waking.filter((i) => i.delivery !== "queue")
+check(
+  'terminal wakes are queued (delivery: "queue"), never steered into a turn',
+  unqueuedWakes.length === 0,
+  `${unqueuedWakes.length} unwoken terminal notification(s) without delivery: "queue"`,
+)
+const silentTerminals = silent.filter((i) => TERMINAL_MARKER.test(i.text))
+check(
+  "terminal outcomes are never posted silently (resume: false)",
+  silentTerminals.length === 0,
+  `${silentTerminals.length} terminal notification(s) posted with resume: false`,
 )
 
 if (failures > 0) {
